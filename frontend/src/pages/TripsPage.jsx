@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { format, parseISO } from 'date-fns';
-import { toast } from 'react-toastify';
 import { getTrips } from '../services/api';
 
 const TripsPage = () => {
@@ -70,7 +69,6 @@ const TripsPage = () => {
     } catch (err) {
       console.error('Error fetching trips:', err);
       setError('Failed to load trips. Please try again later.');
-      toast.error('Failed to load trips');
     } finally {
       setIsLoading(false);
     }
