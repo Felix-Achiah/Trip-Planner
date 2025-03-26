@@ -4,9 +4,13 @@ import requests
 import json
 from datetime import datetime, timedelta, time
 import math
+import logging
 
 # Load environment variables
 load_dotenv()
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Constants for HOS regulations
 MAX_DRIVING_TIME = 11  # hours
@@ -20,7 +24,6 @@ PICKUP_DROPOFF_TIME = 1  # hour
 
 # Mapping API configuration
 MAPBOX_API_KEY = os.getenv('MAPBOX_API_KEY')
-
 
 def calculate_route_service(current_location, pickup_location, dropoff_location, current_cycle_hours):
     """
@@ -42,10 +45,6 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
         f"{dropoff_location[1]},{dropoff_location[0]}"
     ]
     
-    # For demonstration, we'll construct a simple route
-    # In production, use actual Mapbox API
-    
-    # Simulated API call
     url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{';'.join(waypoints)}"
     params = {
         'access_token': MAPBOX_API_KEY,
@@ -53,7 +52,6 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
         'overview': 'full',
         'steps': 'true'
     }
-    response = requests.get(url, params=params)
     response = requests.get(url, params=params)
     if response.status_code != 200:
         raise Exception(f"Mapbox API error: {response.status_code} - {response.text}")
@@ -87,8 +85,17 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
         'segments': segments
     }
 
-
 def calculate_rest_stops(route_data, current_cycle_hours):
+    """
+    Calculate rest stops based on route data and HOS regulations.
+    
+    Args:
+        route_data (dict): Route data from calculate_route_service
+        current_cycle_hours (float): Current cycle hours used
+        
+    Returns:
+        list: List of rest stops (rest, fuel, overnight)
+    """
     segments = route_data['segments']
     total_distance = route_data['total_distance']
     
@@ -102,7 +109,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
     rest_stops = []
     current_position = None
     
-    print(f"Starting: drive_time={remaining_drive_time}, on_duty={remaining_on_duty_time}, cycle={remaining_cycle_time}")
+    logger.info(f"Calculating rest stops: drive_time={remaining_drive_time}, on_duty={remaining_on_duty_time}, cycle={remaining_cycle_time}")
     
     for i, segment in enumerate(segments):
         if i == 0:
@@ -115,7 +122,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
         possible_distance = segment['distance']
         segment_time = segment['duration']
         
-        print(f"Segment {i}: distance={possible_distance}, time={segment_time}, time_since_break={time_since_break}")
+        logger.info(f"Segment {i}: distance={possible_distance}, time={segment_time}, time_since_break={time_since_break}")
         
         while segment_time > 0:
             if time_since_break + segment_time > MAX_DRIVING_BEFORE_BREAK:
@@ -138,7 +145,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 distance_since_fuel += drive_distance_before_break
                 segment_time -= drive_time_before_break
                 possible_distance -= drive_distance_before_break
-                print(f"Added rest stop: remaining_segment_time={segment_time}")
+                logger.info(f"Added rest stop: remaining_segment_time={segment_time}")
             
             elif distance_since_fuel + possible_distance > MAX_DISTANCE_BEFORE_FUEL:
                 distance_before_fuel = MAX_DISTANCE_BEFORE_FUEL - distance_since_fuel
@@ -160,7 +167,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 distance_since_fuel = 0
                 segment_time -= time_before_fuel
                 possible_distance -= distance_before_fuel
-                print(f"Added fuel stop: remaining_segment_time={segment_time}")
+                logger.info(f"Added fuel stop: remaining_segment_time={segment_time}")
             
             elif remaining_on_duty_time < segment_time or remaining_drive_time < segment_time:
                 rest_stops.append({
@@ -176,7 +183,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 remaining_drive_time = MAX_DRIVING_TIME
                 remaining_on_duty_time = MAX_ON_DUTY_TIME
                 time_since_break = 0
-                print(f"Added overnight stop: remaining_segment_time={segment_time}")
+                logger.info(f"Added overnight stop: remaining_segment_time={segment_time}")
             
             else:
                 current_time += timedelta(hours=segment_time)
@@ -187,17 +194,16 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 distance_since_fuel += possible_distance
                 segment_time = 0
                 current_position = segment['end_coord']
-                print(f"Completed segment: time_since_break={time_since_break}")
+                logger.info(f"Completed segment: time_since_break={time_since_break}")
     
     if segments:
         remaining_on_duty_time -= PICKUP_DROPOFF_TIME
         remaining_cycle_time -= PICKUP_DROPOFF_TIME
     
-    print(f"Rest stops calculated: {rest_stops}")
+    logger.info(f"Rest stops calculated: {rest_stops}")
     return rest_stops
 
-
-def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours):
+def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user):
     """
     Generate ELD logs for the trip
     
@@ -206,10 +212,26 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours):
         route: Route model instance
         waypoints: QuerySet of Waypoint instances
         current_cycle_hours: Current cycle hours used
+        user: The authenticated user (for validation)
         
     Returns:
         dict: ELD log data including log entries and daily logs
+        
+    Raises:
+        ValueError: If the trip does not belong to the user
     """
+    # Validate that the trip belongs to the user
+    if trip.user != user:
+        logger.error(f"User {user.id} attempted to generate logs for trip {trip.id} that does not belong to them")
+        raise ValueError("Trip does not belong to the authenticated user")
+
+    # Validate that waypoints belong to the trip's route
+    if waypoints.filter(route_id=route.id).count() != waypoints.count():
+        logger.error(f"Waypoints provided for trip {trip.id} do not all belong to route {route.id}")
+        raise ValueError("Some waypoints do not belong to the trip's route")
+
+    logger.info(f"Generating ELD logs for trip {trip.id} for user {user.id}")
+
     log_entries = []
     daily_logs = []
     
@@ -521,11 +543,12 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours):
     daily_log['ending_odometer'] = calculate_odometer(daily_log['starting_odometer'], daily_log['total_driving_hours'])
     daily_logs.append(daily_log)
     
+    logger.info(f"Generated {len(log_entries)} log entries and {len(daily_logs)} daily logs for trip {trip.id}")
+    
     return {
         'log_entries': log_entries,
         'daily_logs': daily_logs
     }
-
 
 def initialize_log_grid():
     """Initialize a 24-hour log grid with 15-minute intervals"""
@@ -538,7 +561,6 @@ def initialize_log_grid():
                 'status': None
             })
     return grid
-
 
 def update_log_grid(grid, start_time, end_time, status):
     """Update log grid with status for the given time period"""
@@ -558,7 +580,6 @@ def update_log_grid(grid, start_time, end_time, status):
     for cell in grid:
         if cell['time'] >= start_grid_time and cell['time'] <= end_grid_time:
             cell['status'] = status
-
 
 def calculate_odometer(starting_odometer, driving_hours):
     """Calculate ending odometer based on driving hours (assuming avg speed of 55 mph)"""

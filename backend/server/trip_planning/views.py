@@ -2,6 +2,7 @@ from django.shortcuts import render
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 import requests
 import json
@@ -25,9 +26,30 @@ load_dotenv()
 
 class LocationViewSet(viewsets.ModelViewSet):
     """ViewSet for Location CRUD operations"""
-    queryset = Location.objects.all()
+    permission_classes = [IsAuthenticated]
     serializer_class = LocationSerializer
-    
+
+    def get_queryset(self):
+        """
+        Filter locations to only those associated with the authenticated user's trips.
+        This includes current_location, pickup_location, dropoff_location, and waypoints.
+        """
+        user = self.request.user
+        # Get locations associated with the user's trips
+        trip_locations = Location.objects.filter(
+            id__in=Trip.objects.filter(user=user).values_list(
+                'current_location_id', 'pickup_location_id', 'dropoff_location_id'
+            )
+        )
+        # Get locations associated with waypoints of the user's trips
+        waypoint_locations = Location.objects.filter(
+            id__in=Waypoint.objects.filter(
+                route__trip__user=user
+            ).values_list('location_id')
+        )
+        # Combine the two querysets using | (union)
+        return trip_locations | waypoint_locations
+
     @action(detail=False, methods=['post'])
     def geocode(self, request):
         """Convert address to lat/long using geocoding API"""
@@ -58,12 +80,24 @@ class LocationViewSet(viewsets.ModelViewSet):
 
 class TripViewSet(viewsets.ModelViewSet):
     """ViewSet for Trip CRUD operations"""
-    queryset = Trip.objects.all()
+    permission_classes = [IsAuthenticated]
     serializer_class = TripSerializer
-    
+
+    def get_queryset(self):
+        """
+        Filter trips to only those belonging to the authenticated user.
+        """
+        return Trip.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        """
+        Automatically set the user field to the authenticated user when creating a trip.
+        """
+        serializer.save(user=self.request.user)
+
     @action(detail=True, methods=['post'])
     def calculate_route(self, request, pk=None):
-        trip = self.get_object()
+        trip = self.get_object()  # This will automatically respect the user filter
         
         try:
             route_data = calculate_route_service(
@@ -151,7 +185,7 @@ class TripViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def generate_logs(self, request, pk=None):
         """Generate ELD logs for the trip"""
-        trip = self.get_object()
+        trip = self.get_object()  # This will automatically respect the user filter
         
         try:
             # Ensure route has been calculated
@@ -165,12 +199,13 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.log_entries.all().delete()
             trip.daily_logs.all().delete()
             
-            # Call service to generate logs
+            # Call service to generate logs, passing the authenticated user
             logs_data = generate_eld_logs_service(
                 trip=trip,
                 route=trip.route,
                 waypoints=trip.route.waypoints.all(),
-                current_cycle_hours=trip.current_cycle_hours
+                current_cycle_hours=trip.current_cycle_hours,
+                user=request.user  # Pass the authenticated user
             )
             
             # Create log entries
@@ -209,18 +244,27 @@ class TripViewSet(viewsets.ModelViewSet):
 
 class RouteViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for retrieving Route information"""
-    queryset = Route.objects.all()
+    permission_classes = [IsAuthenticated]
     serializer_class = RouteSerializer
+
+    def get_queryset(self):
+        """
+        Filter routes to only those associated with the authenticated user's trips.
+        """
+        return Route.objects.filter(trip__user=self.request.user)
 
 
 class WaypointViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for retrieving Waypoint information"""
-    queryset = Waypoint.objects.all()
+    permission_classes = [IsAuthenticated]
     serializer_class = WaypointSerializer
-    
+
     def get_queryset(self):
-        """Filter waypoints by route if provided"""
-        queryset = Waypoint.objects.all()
+        """
+        Filter waypoints to only those associated with the authenticated user's trips.
+        Optionally filter by route_id if provided in query params.
+        """
+        queryset = Waypoint.objects.filter(route__trip__user=self.request.user)
         route_id = self.request.query_params.get('route', None)
         if route_id:
             queryset = queryset.filter(route_id=route_id)
@@ -229,12 +273,15 @@ class WaypointViewSet(viewsets.ReadOnlyModelViewSet):
 
 class LogEntryViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for retrieving LogEntry information"""
-    queryset = LogEntry.objects.all()
+    permission_classes = [IsAuthenticated]
     serializer_class = LogEntrySerializer
-    
+
     def get_queryset(self):
-        """Filter log entries by trip if provided"""
-        queryset = LogEntry.objects.all()
+        """
+        Filter log entries to only those associated with the authenticated user's trips.
+        Optionally filter by trip_id if provided in query params.
+        """
+        queryset = LogEntry.objects.filter(trip__user=self.request.user)
         trip_id = self.request.query_params.get('trip', None)
         if trip_id:
             queryset = queryset.filter(trip_id=trip_id)
@@ -243,12 +290,15 @@ class LogEntryViewSet(viewsets.ReadOnlyModelViewSet):
 
 class DailyLogViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for retrieving DailyLog information"""
-    queryset = DailyLog.objects.all()
+    permission_classes = [IsAuthenticated]
     serializer_class = DailyLogSerializer
-    
+
     def get_queryset(self):
-        """Filter daily logs by trip if provided"""
-        queryset = DailyLog.objects.all()
+        """
+        Filter daily logs to only those associated with the authenticated user's trips.
+        Optionally filter by trip_id if provided in query params.
+        """
+        queryset = DailyLog.objects.filter(trip__user=self.request.user)
         trip_id = self.request.query_params.get('trip', None)
         if trip_id:
             queryset = queryset.filter(trip_id=trip_id)
