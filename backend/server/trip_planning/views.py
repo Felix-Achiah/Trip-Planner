@@ -185,10 +185,9 @@ class TripViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def generate_logs(self, request, pk=None):
         """Generate ELD logs for the trip"""
-        trip = self.get_object()  # This will automatically respect the user filter
+        trip = self.get_object()  
         
         try:
-            # Ensure route has been calculated
             if not hasattr(trip, 'route'):
                 return Response(
                     {'error': 'Route must be calculated before generating logs'}, 
