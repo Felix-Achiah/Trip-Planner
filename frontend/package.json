@@ -12,8 +12,6 @@
   "dependencies": {
     "@reduxjs/toolkit": "^2.6.1",
     "@tanstack/react-query": "^5.69.0",
-    "axios": "^1.8.4",
-    "bootstrap": "^5.3.3",
     "date-fns": "^4.1.0",
     "jspdf": "^3.0.1",
     "jspdf-autotable": "^5.0.2",
@@ -21,7 +19,6 @@
     "lucide-react": "^0.483.0",
     "mapbox-gl": "^3.10.0",
     "react": "^18.2.0",
-    "react-bootstrap": "^2.10.9",
     "react-dom": "^18.2.0",
     "react-map-gl": "^7.1.7",
     "react-redux": "^9.2.0",
