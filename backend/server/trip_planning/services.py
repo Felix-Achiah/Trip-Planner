@@ -229,6 +229,17 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     if waypoints.filter(route_id=route.id).count() != waypoints.count():
         logger.error(f"Waypoints provided for trip {trip.id} do not all belong to route {route.id}")
         raise ValueError("Some waypoints do not belong to the trip's route")
+    
+    # Validate that pickup and dropoff waypoints exist
+    pickup_waypoint = waypoints.filter(waypoint_type='pickup').first()
+    if not pickup_waypoint:
+        logger.error(f"No pickup waypoint found for trip {trip.id}")
+        raise ValueError("No pickup waypoint found for the trip")
+
+    dropoff_waypoint = waypoints.filter(waypoint_type='dropoff').first()
+    if not dropoff_waypoint:
+        logger.error(f"No dropoff waypoint found for trip {trip.id}")
+        raise ValueError("No dropoff waypoint found for the trip")
 
     logger.info(f"Generating ELD logs for trip {trip.id} for user {user.id}")
 
@@ -296,19 +307,19 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
         if i == 0 and event['type'] == 'pickup':
             # Driver is driving from current location to pickup
             driving_duration = (event['time'] - trip.start_time).total_seconds() / 3600
-            
-            # Add driving log entry
-            log_entries.append({
-                'start_time': trip.start_time,
-                'end_time': event['time'],
-                'status': 'driving',
-                'location_id': trip.current_location.id,
-                'notes': f"Driving to pickup location"
-            })
-            
-            # Update daily log
-            daily_log['total_driving_hours'] += driving_duration
-            update_log_grid(daily_log['log_data'], trip.start_time, event['time'], 'driving')
+            if driving_duration > 0:
+                # Add driving log entry
+                log_entries.append({
+                    'start_time': trip.start_time,
+                    'end_time': event['time'],
+                    'status': 'driving',
+                    'location_id': trip.current_location.id,
+                    'notes': f"Driving to pickup location"
+                })
+                
+                # Update daily log
+                daily_log['total_driving_hours'] += driving_duration
+                update_log_grid(daily_log['log_data'], trip.start_time, event['time'], 'driving')
             
             current_status = 'driving'
             status_start_time = trip.start_time
