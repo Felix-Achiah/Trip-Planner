@@ -188,9 +188,6 @@ STATIC_URL = 'static/'
 
 AUTH_USER_MODEL = 'user_auth.User'
 
-CORS_ALLOWED_ORIGINS = [
-    "https://trip-planner-mu-bice.vercel.app",
-    "http://localhost:5173"
-]
+CORS_ORIGIN_ALLOW_ALL = True
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
