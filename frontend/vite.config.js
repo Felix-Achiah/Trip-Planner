@@ -10,11 +10,14 @@ export default defineConfig({
       plugins: [tailwindcss()],
     },
   },
+  base: '/',
+  server: {
+    historyApiFallback: true,  // Enable fallback routing for React Router
+  },
   resolve: {
     alias: {
       // Optional: Add aliases if needed for other imports
     },
-    // Ensure mapbox-gl and react-map-gl are resolved correctly
     dedupe: ['mapbox-gl', 'react-map-gl'],
   },
   optimizeDeps: {
