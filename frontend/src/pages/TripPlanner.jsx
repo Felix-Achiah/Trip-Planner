@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
+import { toast } from 'react-toastify';
 
 import TripForm from '../components/TripForm.jsx';
 import RouteMap from '../components/RouteMap.jsx';
-import { calculateRoute } from '../services/api';
+import { calculateRoute, generateLogs } from '../services/api';
 
 const TripPlanner = () => {
   const [tripId, setTripId] = useState(null);
@@ -19,6 +20,12 @@ const TripPlanner = () => {
     try {
       const routeResponse = await calculateRoute(id);
       setRouteData(routeResponse.data);
+
+      await generateLogs(id);
+      toast.success('Route calculated and logs generated successfully!', {
+        position: 'top-right',
+        autoClose: 3000,
+      });
     } catch (error) {
       console.error('Error calculating route:', error);
       alert('Failed to calculate route or generate logs');
