@@ -1,0 +1,24 @@
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environments
+myenv/
+.env/
+.env.local
+*.env
+
+# Ignore Django secret keys & database files
+*.sqlite3
+db.sqlite3
+*.log
+
+# Ignore static and media files (if built dynamically)
+staticfiles/
+media/
