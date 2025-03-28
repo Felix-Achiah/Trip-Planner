@@ -8,7 +8,6 @@ import TripPlanner from './pages/TripPlanner.jsx';
 import SignInPage from './pages/SignIn.jsx';
 import SignUpPage from './pages/SignUp.jsx';
 import TripsPage from './pages/TripsPage.jsx';
-import DailyLogsPage from './pages/DailyLogsPage.jsx';
 
 // eslint-disable-next-line no-unused-vars
 const PrivateRoute = ({ element: Element }) => {
