@@ -2,10 +2,10 @@ import os
 from dotenv import load_dotenv
 import requests
 import json
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 import math
 import logging
-from django.utils import timezone
+from django.utils import timezone as django_timezone # Alias to avoid confusion
 
 # Load environment variables
 load_dotenv()
@@ -310,6 +310,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
     
     logger.info(f"Rest stops calculated: {rest_stops}")
     return rest_stops
+
 def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user):
     """
     Generate ELD logs for the trip based on pre-calculated waypoints, handling edge cases.
@@ -346,7 +347,7 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     odometer = 0
     
     # Ensure trip.start_time is timezone-aware
-    trip_start_time = timezone.make_aware(trip.start_time) if not timezone.is_aware(trip.start_time) else trip.start_time
+    trip_start_time = django_timezone.make_aware(trip.start_time) if not django_timezone.is_aware(trip.start_time) else trip.start_time
     current_time = trip_start_time
     # Set end time to March 29, 09:30 UTC (end of dropoff)
     end_log_time = datetime(2025, 3, 29, 9, 30, tzinfo=timezone.utc)
@@ -359,7 +360,7 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     if not pickup_waypoint:
         logger.error(f"No pickup waypoint found for trip {trip.id}")
         raise ValueError("No pickup waypoint found for the trip")
-    pickup_time = timezone.make_aware(pickup_waypoint.estimated_arrival) if not timezone.is_aware(pickup_waypoint.estimated_arrival) else pickup_waypoint.estimated_arrival
+    pickup_time = django_timezone.make_aware(pickup_waypoint.estimated_arrival) if not django_timezone.is_aware(pickup_waypoint.estimated_arrival) else pickup_waypoint.estimated_arrival
     events.append({
         'type': 'pickup',
         'time': pickup_time,
@@ -369,7 +370,7 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     
     # Add all rest stops, fuel stops, overnight stops, and mandatory breaks
     for waypoint in waypoints.filter(waypoint_type__in=['rest', 'fuel', 'overnight', 'mandatory_break']).order_by('estimated_arrival'):
-        waypoint_time = timezone.make_aware(waypoint.estimated_arrival) if not timezone.is_aware(waypoint.estimated_arrival) else waypoint.estimated_arrival
+        waypoint_time = django_timezone.make_aware(waypoint.estimated_arrival) if not django_timezone.is_aware(waypoint.estimated_arrival) else waypoint.estimated_arrival
         events.append({
             'type': waypoint.waypoint_type,
             'time': waypoint_time,
@@ -382,7 +383,7 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     if not dropoff_waypoint:
         logger.error(f"No dropoff waypoint found for trip {trip.id}")
         raise ValueError("No dropoff waypoint found for the trip")
-    dropoff_time = timezone.make_aware(dropoff_waypoint.estimated_arrival) if not timezone.is_aware(dropoff_waypoint.estimated_arrival) else dropoff_waypoint.estimated_arrival
+    dropoff_time = django_timezone.make_aware(dropoff_waypoint.estimated_arrival) if not django_timezone.is_aware(dropoff_waypoint.estimated_arrival) else dropoff_waypoint.estimated_arrival
     events.append({
         'type': 'dropoff',
         'time': dropoff_time,
