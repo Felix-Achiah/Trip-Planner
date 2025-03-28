@@ -134,22 +134,24 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
 
 def interpolate_coordinates(start_coord, end_coord, fraction):
     """
-    Interpolate coordinates along a segment based on the fraction of the distance traveled.
+    Interpolate between two coordinates based on a fraction.
     
     Args:
-        start_coord (tuple): Starting coordinates (longitude, latitude)
-        end_coord (tuple): Ending coordinates (longitude, latitude)
-        fraction (float): Fraction of the distance traveled (0 to 1)
-    
+        start_coord (list): [lng, lat] of start coordinate
+        end_coord (list): [lng, lat] of end coordinate
+        fraction (float): Fraction of the distance between start and end (0 to 1)
+        
     Returns:
-        tuple: Interpolated coordinates (longitude, latitude)
+        list: Interpolated [lng, lat]
     """
-    start_lon, start_lat = start_coord
-    end_lon, end_lat = end_coord
-    interpolated_lon = start_lon + (end_lon - start_lon) * fraction
+    logger.debug(f"Interpolating: start={start_coord}, end={end_coord}, fraction={fraction}")
+    start_lng, start_lat = start_coord
+    end_lng, end_lat = end_coord
+    interpolated_lng = start_lng + (end_lng - start_lng) * fraction
     interpolated_lat = start_lat + (end_lat - start_lat) * fraction
-    return (interpolated_lon, interpolated_lat)
-
+    result = [interpolated_lng, interpolated_lat]
+    logger.debug(f"Interpolated coordinate: {result}")
+    return result
 def calculate_rest_stops(route_data, current_cycle_hours, trip_start_time):
     """
     Calculate rest stops based on route data and HOS regulations.
