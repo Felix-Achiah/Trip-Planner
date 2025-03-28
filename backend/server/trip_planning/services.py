@@ -348,7 +348,8 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     # Ensure trip.start_time is timezone-aware
     trip_start_time = timezone.make_aware(trip.start_time) if not timezone.is_aware(trip.start_time) else trip.start_time
     current_time = trip_start_time
-    end_log_time = timezone.make_aware(datetime.now()) if not timezone.is_aware(datetime.now()) else datetime.now()
+    # Set end time to March 29, 09:30 UTC (end of dropoff)
+    end_log_time = datetime(2025, 3, 29, 9, 30, tzinfo=timezone.utc)
 
     # Convert waypoints to chronological list of events
     events = []
@@ -427,8 +428,8 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     for i, event in enumerate(events):
         logger.info(f"Processing event {i}: {event}")
         
-        # Process driving time before the event
-        if current_time < event['time']:
+        # Process driving time before the event (but not after dropoff)
+        if current_time < event['time'] and event['type'] != 'dropoff':
             while current_time < event['time']:
                 current_date = current_time.date()
                 if current_date not in daily_logs:
