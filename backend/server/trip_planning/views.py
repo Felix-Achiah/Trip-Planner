@@ -9,7 +9,7 @@ import json
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from django.utils import timezone
+from django.utils.timezone import make_aware
 import logging
 
 from .models import Trip, Route, Location, Waypoint, LogEntry, DailyLog
@@ -101,7 +101,7 @@ class TripViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def calculate_route(self, request, pk=None):
-        trip = self.get_object()  # This will automatically respect the user filter
+        trip = self.get_object()
         
         try:
             route_data = calculate_route_service(
@@ -112,8 +112,9 @@ class TripViewSet(viewsets.ModelViewSet):
             )
             route_data['start_time'] = trip.start_time
         except Exception as e:
+            logger.error(f"Route calculation failed: {e}")
             return Response({'error': f'Route calculation failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+
         route, created = Route.objects.get_or_create(
             trip=trip,
             defaults={
@@ -128,14 +129,15 @@ class TripViewSet(viewsets.ModelViewSet):
             route.estimated_driving_time = route_data['estimated_driving_time']
             route.route_data = route_data['route_data']
             route.save()
-        
+
         try:
             route.waypoints.all().delete()
             rest_stops = calculate_rest_stops(route_data=route_data, current_cycle_hours=trip.current_cycle_hours)
             
             sequence = 0
-            # Calculate pickup arrival time based on driving from current_location to pickup_location
-            pickup_arrival = trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600)
+            pickup_arrival = make_aware(trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600))
+            
+            logger.info("Creating Pickup Waypoint")
             Waypoint.objects.create(
                 route=route,
                 location=trip.pickup_location,
@@ -153,40 +155,46 @@ class TripViewSet(viewsets.ModelViewSet):
                     longitude=stop['longitude'],
                     address=stop.get('address', '')
                 )
+                
+                estimated_arrival = make_aware(stop['estimated_arrival'])
+                
+                logger.info(f"Creating Waypoint for {stop['name']} at ({stop['latitude']}, {stop['longitude']})")
                 Waypoint.objects.create(
                     route=route,
                     location=stop_location,
                     waypoint_type=stop['type'],
                     sequence=sequence,
-                    estimated_arrival=stop['estimated_arrival'],
+                    estimated_arrival=estimated_arrival,
                     planned_duration=stop['duration']
                 )
                 sequence += 1
             
             if rest_stops:
                 last_stop_duration = rest_stops[-1]['duration']
-                last_arrival = rest_stops[-1]['estimated_arrival']
+                last_arrival = make_aware(rest_stops[-1]['estimated_arrival'])
             else:
                 last_stop_duration = 0
-                last_arrival = trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600 + 1)  # Pickup duration
+                last_arrival = make_aware(trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600 + 1))
             
             final_segment_duration = route_data['segments'][-1]['duration'] / 3600
             final_eta = last_arrival + timedelta(hours=last_stop_duration + final_segment_duration)
             
+            logger.info("Creating Dropoff Waypoint")
             Waypoint.objects.create(
                 route=route,
                 location=trip.dropoff_location,
                 waypoint_type='dropoff',
                 sequence=sequence,
-                estimated_arrival=final_eta,
+                estimated_arrival=make_aware(final_eta),
                 planned_duration=1.0
             )
             
-            trip.estimated_end_time = final_eta + timedelta(hours=1)
+            trip.estimated_end_time = make_aware(final_eta + timedelta(hours=1))
             trip.save()
             
             return Response(RouteSerializer(route).data)
         except Exception as e:
+            logger.error(f"Error processing waypoints: {e}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     @action(detail=True, methods=['post'])
