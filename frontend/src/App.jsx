@@ -37,7 +37,6 @@ const AppContent = () => {
         <Route path="/signup" element={<SignUpPage />} />
         <Route path="/" element={<PrivateRoute element={TripPlanner} />} />
         <Route path="/trips" element={<PrivateRoute element={TripsPage} />} />
-        <Route path="/daily-logs" element={<PrivateRoute element={DailyLogsPage} />} />
         <Route path="*" element={<Navigate to="/login" />} />
       </Routes>
       <ToastContainer

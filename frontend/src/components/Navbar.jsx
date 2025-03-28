@@ -97,18 +97,6 @@ const Navbar = () => {
                 My Trips
               </NavLink>
               
-              <NavLink 
-                to="/daily-logs" 
-                className={({ isActive }) => 
-                  `px-3 py-2 rounded-md text-sm font-medium transition-colors duration-200 ${
-                    isActive 
-                      ? (scrolled ? 'bg-indigo-100 text-indigo-700' : 'bg-indigo-700 text-white') 
-                      : (scrolled ? 'text-gray-700 hover:bg-gray-100' : 'text-indigo-100 hover:bg-indigo-700 hover:text-white')
-                  }`
-                }
-              >
-                Daily Logs
-              </NavLink>
             </div>
           </div>
 
@@ -204,18 +192,6 @@ const Navbar = () => {
             }
           >
             My Trips
-          </NavLink>
-          <NavLink
-            to="/daily-logs"
-            className={({ isActive }) =>
-              `block px-3 py-2 rounded-md text-base font-medium ${
-                isActive
-                  ? (scrolled ? 'bg-indigo-100 text-indigo-700' : 'bg-indigo-700 text-white')
-                  : (scrolled ? 'text-gray-700 hover:bg-gray-100' : 'text-indigo-100 hover:bg-indigo-700 hover:text-white')
-              }`
-            }
-          >
-            Daily Logs
           </NavLink>
         </div>
         <div className="pt-4 pb-3 border-t border-indigo-800">

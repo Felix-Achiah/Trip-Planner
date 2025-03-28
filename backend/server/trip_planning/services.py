@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta, time
 import math
 import logging
+from django.utils import timezone
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +22,8 @@ MAX_DRIVING_BEFORE_BREAK = 8  # hours
 FUEL_STOP_DURATION = 0.5  # 30 minutes for fueling
 MAX_DISTANCE_BEFORE_FUEL = 1000  # miles
 PICKUP_DROPOFF_TIME = 1  # hour
+MANDATORY_RESET_BREAK = 10  # hours (assumed for resetting the 11-hour driving and 14-hour on-duty limits)
+AVERAGE_SPEED = 55  # mph
 
 # Mapping API configuration
 MAPBOX_API_KEY = os.getenv('MAPBOX_API_KEY')
@@ -203,7 +206,6 @@ def calculate_rest_stops(route_data, current_cycle_hours):
     
     logger.info(f"Rest stops calculated: {rest_stops}")
     return rest_stops
-
 def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user):
     """
     Generate ELD logs for the trip
@@ -233,56 +235,851 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
 
     logger.info(f"Generating ELD logs for trip {trip.id} for user {user.id}")
 
+    # Initialize variables
     log_entries = []
-    daily_logs = []
+    daily_logs = {}
     
-    # Start with trip start time
-    current_time = trip.start_time
+    # Ensure trip.start_time is timezone-aware
+    trip_start_time = timezone.make_aware(trip.start_time) if not timezone.is_aware(trip.start_time) else trip.start_time
+    current_date = trip_start_time.date()
+    
+    # Initialize daily log for the first day
+    daily_logs[current_date] = initialize_daily_log(current_date)
     
     # Convert waypoints to chronological list of events
     events = []
     
     # Add pickup event
     pickup_waypoint = waypoints.filter(waypoint_type='pickup').first()
-    if pickup_waypoint:
-        events.append({
-            'type': 'pickup',
-            'time': pickup_waypoint.estimated_arrival,
-            'duration': pickup_waypoint.planned_duration,
-            'location': pickup_waypoint.location
-        })
+    if not pickup_waypoint:
+        logger.error(f"No pickup waypoint found for trip {trip.id}")
+        raise ValueError("No pickup waypoint found for the trip")
+    pickup_time = timezone.make_aware(pickup_waypoint.estimated_arrival) if not timezone.is_aware(pickup_waypoint.estimated_arrival) else pickup_waypoint.estimated_arrival
+    events.append({
+        'type': 'pickup',
+        'time': pickup_time,
+        'duration': pickup_waypoint.planned_duration,
+        'location': pickup_waypoint.location
+    })
     
-    # Add all rest stops and fuel stops
+    # Add all rest stops, fuel stops, and overnight stops
     for waypoint in waypoints.filter(waypoint_type__in=['rest', 'fuel', 'overnight']).order_by('estimated_arrival'):
+        waypoint_time = timezone.make_aware(waypoint.estimated_arrival) if not timezone.is_aware(waypoint.estimated_arrival) else waypoint.estimated_arrival
         events.append({
             'type': waypoint.waypoint_type,
-            'time': waypoint.estimated_arrival,
+            'time': waypoint_time,
             'duration': waypoint.planned_duration,
             'location': waypoint.location
         })
     
     # Add dropoff event
     dropoff_waypoint = waypoints.filter(waypoint_type='dropoff').first()
-    if dropoff_waypoint:
-        events.append({
-            'type': 'dropoff',
-            'time': dropoff_waypoint.estimated_arrival,
-            'duration': dropoff_waypoint.planned_duration,
-            'location': dropoff_waypoint.location
-        })
+    if not dropoff_waypoint:
+        logger.error(f"No dropoff waypoint found for trip {trip.id}")
+        raise ValueError("No dropoff waypoint found for the trip")
+    dropoff_time = timezone.make_aware(dropoff_waypoint.estimated_arrival) if not timezone.is_aware(dropoff_waypoint.estimated_arrival) else dropoff_waypoint.estimated_arrival
+    events.append({
+        'type': 'dropoff',
+        'time': dropoff_time,
+        'duration': dropoff_waypoint.planned_duration,
+        'location': dropoff_waypoint.location
+    })
     
     # Sort events by time
     events.sort(key=lambda x: x['time'])
+    logger.info(f"Events to process: {events}")
+
+    # Insert fuel stops based on distance
+    total_distance = 0
+    last_fuel_stop_time = trip_start_time
+    i = 0
+    while i < len(events) - 1:
+        start_event = events[i]
+        end_event = events[i + 1]
+        driving_duration = (end_event['time'] - (start_event['time'] + timedelta(hours=start_event['duration']))).total_seconds() / 3600
+        if driving_duration > 0:
+            distance = driving_duration * AVERAGE_SPEED
+            total_distance += distance
+            if total_distance >= MAX_DISTANCE_BEFORE_FUEL:
+                # Calculate the time to drive MAX_DISTANCE_BEFORE_FUEL miles since the last fuel stop
+                remaining_distance = MAX_DISTANCE_BEFORE_FUEL - (total_distance - distance)
+                time_to_fuel = remaining_distance / AVERAGE_SPEED
+                fuel_stop_time = start_event['time'] + timedelta(hours=start_event['duration']) + timedelta(hours=time_to_fuel)
+                if fuel_stop_time < end_event['time']:
+                    events.insert(i + 1, {
+                        'type': 'fuel',
+                        'time': fuel_stop_time,
+                        'duration': FUEL_STOP_DURATION,
+                        'location': start_event['location']
+                    })
+                    total_distance = 0
+                    last_fuel_stop_time = fuel_stop_time
+                    i += 1  # Increment i to account for the newly inserted event
+                    logger.info(f"Inserted fuel stop at {fuel_stop_time}")
+        i += 1
     
-    # Initialize current state
-    current_date = trip.start_time.date()
-    current_status = None
-    status_start_time = None
+    # Re-sort events after adding fuel stops
+    events.sort(key=lambda x: x['time'])
     
-    # Create a daily log for the first day
-    daily_log = {
+    # Initialize status tracking
+    current_status = 'off_duty'
+    status_start_time = trip_start_time
+    cycle_driving_hours = 0  # Track driving hours in the current duty cycle
+    cycle_on_duty_hours = 0  # Track total on-duty hours (driving + on_duty_not_driving)
+    driving_since_last_break = 0  # Track driving hours since the last 30-minute break
+    total_cycle_hours = current_cycle_hours  # Track 8-day cycle hours
+    last_reset_time = trip_start_time  # Track the last time a 10-hour reset occurred
+    current_odometer = 0  # Track odometer for fuel stop calculations
+    
+    # Process each event chronologically
+    for i, event in enumerate(events):
+        logger.info(f"Processing event {i}: {event}")
+        
+        # If this is the first event, add driving time from trip start to first event
+        if i == 0 and event['type'] == 'pickup':
+            driving_duration = (event['time'] - trip.start_time).total_seconds() / 3600
+            logger.info(f"Initial driving duration: {driving_duration} hours")
+            if driving_duration > 0:
+                current_time = trip.start_time
+                while current_time < event['time']:
+                    current_date = current_time.date()
+                    if current_date not in daily_logs:
+                        daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                    next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                    end_segment = min(next_day, event['time'])
+                    segment_duration = (end_segment - current_time).total_seconds() / 3600
+                    
+                    # Enforce 11-hour driving limit
+                    if cycle_driving_hours + segment_duration > MAX_DRIVING_TIME:
+                        segment_duration = MAX_DRIVING_TIME - cycle_driving_hours
+                        end_segment = current_time + timedelta(hours=segment_duration)
+                        # Insert a mandatory 10-hour reset break
+                        break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                        events.insert(i + 1, {
+                            'type': 'reset_break',
+                            'time': end_segment,
+                            'duration': MANDATORY_RESET_BREAK,
+                            'location': event['location']
+                        })
+                        events.sort(key=lambda x: x['time'])
+                        cycle_driving_hours = 0
+                        cycle_on_duty_hours = 0
+                        driving_since_last_break = 0
+                        last_reset_time = break_end
+                        logger.info(f"Inserted mandatory 10-hour reset break at {end_segment}")
+                        break  # Exit the loop to reprocess with the new event
+                    
+                    # Enforce 14-hour on-duty limit
+                    if cycle_on_duty_hours + segment_duration > MAX_ON_DUTY_TIME:
+                        segment_duration = MAX_ON_DUTY_TIME - cycle_on_duty_hours
+                        end_segment = current_time + timedelta(hours=segment_duration)
+                        # Insert a mandatory 10-hour reset break
+                        break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                        events.insert(i + 1, {
+                            'type': 'reset_break',
+                            'time': end_segment,
+                            'duration': MANDATORY_RESET_BREAK,
+                            'location': event['location']
+                        })
+                        events.sort(key=lambda x: x['time'])
+                        cycle_driving_hours = 0
+                        cycle_on_duty_hours = 0
+                        driving_since_last_break = 0
+                        last_reset_time = break_end
+                        logger.info(f"Inserted mandatory 10-hour reset break due to 14-hour limit at {end_segment}")
+                        break
+                    
+                    # Enforce 8-hour driving limit before a 30-minute break
+                    if driving_since_last_break + segment_duration > MAX_DRIVING_BEFORE_BREAK:
+                        segment_duration = MAX_DRIVING_BEFORE_BREAK - driving_since_last_break
+                        end_segment = current_time + timedelta(hours=segment_duration)
+                        # Insert a mandatory 30-minute break
+                        break_end = end_segment + timedelta(hours=MANDATORY_BREAK_TIME)
+                        events.insert(i + 1, {
+                            'type': 'mandatory_break',
+                            'time': end_segment,
+                            'duration': MANDATORY_BREAK_TIME,
+                            'location': event['location']
+                        })
+                        events.sort(key=lambda x: x['time'])
+                        driving_since_last_break = 0
+                        logger.info(f"Inserted mandatory 30-minute break at {end_segment}")
+                        break
+                    
+                    # Enforce 70-hour cycle limit
+                    if total_cycle_hours + segment_duration > MAX_CYCLE_TIME:
+                        segment_duration = MAX_CYCLE_TIME - total_cycle_hours
+                        end_segment = current_time + timedelta(hours=segment_duration)
+                        # Insert a mandatory 10-hour reset break
+                        break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                        events.insert(i + 1, {
+                            'type': 'reset_break',
+                            'time': end_segment,
+                            'duration': MANDATORY_RESET_BREAK,
+                            'location': event['location']
+                        })
+                        events.sort(key=lambda x: x['time'])
+                        total_cycle_hours = 0
+                        cycle_driving_hours = 0
+                        cycle_on_duty_hours = 0
+                        driving_since_last_break = 0
+                        last_reset_time = break_end
+                        logger.info(f"Inserted mandatory 10-hour reset break due to 70-hour cycle limit at {end_segment}")
+                        break
+
+                    log_entries.append({
+                        'start_time': current_time,
+                        'end_time': end_segment,
+                        'status': 'driving',
+                        'location_id': trip.current_location.id if hasattr(trip.current_location, 'id') else None,
+                        'notes': f"Driving to pickup location"
+                    })
+                    daily_logs[current_date]['total_driving_hours'] += segment_duration
+                    daily_logs[current_date]['total_on_duty_hours'] += segment_duration  # Driving counts as on-duty
+                    cycle_driving_hours += segment_duration
+                    cycle_on_duty_hours += segment_duration
+                    driving_since_last_break += segment_duration
+                    total_cycle_hours += segment_duration
+                    current_odometer += (segment_duration * AVERAGE_SPEED)
+                    update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
+                    logger.info(f"Added initial driving on {current_date}: {segment_duration} hours")
+                    current_time = end_segment
+            current_status = 'driving'
+            status_start_time = event['time']
+        
+        # Process event based on type
+        if event['type'] == 'pickup':
+            if current_status != 'on_duty_not_driving':
+                if current_status and status_start_time:
+                    duration = (event['time'] - status_start_time).total_seconds() / 3600
+                    if duration > 0:
+                        current_time = status_start_time
+                        while current_time < event['time']:
+                            current_date = current_time.date()
+                            if current_date not in daily_logs:
+                                daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                            next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                            end_segment = min(next_day, event['time'])
+                            segment_duration = (end_segment - current_time).total_seconds() / 3600
+                            
+                            # Enforce 11-hour driving limit
+                            if current_status == 'driving' and cycle_driving_hours + segment_duration > MAX_DRIVING_TIME:
+                                segment_duration = MAX_DRIVING_TIME - cycle_driving_hours
+                                end_segment = current_time + timedelta(hours=segment_duration)
+                                # Insert a mandatory 10-hour reset break
+                                break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                                events.insert(i + 1, {
+                                    'type': 'reset_break',
+                                    'time': end_segment,
+                                    'duration': MANDATORY_RESET_BREAK,
+                                    'location': event['location']
+                                })
+                                events.sort(key=lambda x: x['time'])
+                                cycle_driving_hours = 0
+                                cycle_on_duty_hours = 0
+                                driving_since_last_break = 0
+                                last_reset_time = break_end
+                                logger.info(f"Inserted mandatory 10-hour reset break at {end_segment}")
+                                break
+                            
+                            # Enforce 14-hour on-duty limit
+                            if cycle_on_duty_hours + segment_duration > MAX_ON_DUTY_TIME:
+                                segment_duration = MAX_ON_DUTY_TIME - cycle_on_duty_hours
+                                end_segment = current_time + timedelta(hours=segment_duration)
+                                # Insert a mandatory 10-hour reset break
+                                break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                                events.insert(i + 1, {
+                                    'type': 'reset_break',
+                                    'time': end_segment,
+                                    'duration': MANDATORY_RESET_BREAK,
+                                    'location': event['location']
+                                })
+                                events.sort(key=lambda x: x['time'])
+                                cycle_driving_hours = 0
+                                cycle_on_duty_hours = 0
+                                driving_since_last_break = 0
+                                last_reset_time = break_end
+                                logger.info(f"Inserted mandatory 10-hour reset break due to 14-hour limit at {end_segment}")
+                                break
+                            
+                            # Enforce 8-hour driving limit before a 30-minute break
+                            if current_status == 'driving' and driving_since_last_break + segment_duration > MAX_DRIVING_BEFORE_BREAK:
+                                segment_duration = MAX_DRIVING_BEFORE_BREAK - driving_since_last_break
+                                end_segment = current_time + timedelta(hours=segment_duration)
+                                # Insert a mandatory 30-minute break
+                                break_end = end_segment + timedelta(hours=MANDATORY_BREAK_TIME)
+                                events.insert(i + 1, {
+                                    'type': 'mandatory_break',
+                                    'time': end_segment,
+                                    'duration': MANDATORY_BREAK_TIME,
+                                    'location': event['location']
+                                })
+                                events.sort(key=lambda x: x['time'])
+                                driving_since_last_break = 0
+                                logger.info(f"Inserted mandatory 30-minute break at {end_segment}")
+                                break
+                            
+                            # Enforce 70-hour cycle limit
+                            if total_cycle_hours + segment_duration > MAX_CYCLE_TIME:
+                                segment_duration = MAX_CYCLE_TIME - total_cycle_hours
+                                end_segment = current_time + timedelta(hours=segment_duration)
+                                # Insert a mandatory 10-hour reset break
+                                break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                                events.insert(i + 1, {
+                                    'type': 'reset_break',
+                                    'time': end_segment,
+                                    'duration': MANDATORY_RESET_BREAK,
+                                    'location': event['location']
+                                })
+                                events.sort(key=lambda x: x['time'])
+                                total_cycle_hours = 0
+                                cycle_driving_hours = 0
+                                cycle_on_duty_hours = 0
+                                driving_since_last_break = 0
+                                last_reset_time = break_end
+                                logger.info(f"Inserted mandatory 10-hour reset break due to 70-hour cycle limit at {end_segment}")
+                                break
+                            
+                            log_entries.append({
+                                'start_time': current_time,
+                                'end_time': end_segment,
+                                'status': current_status,
+                                'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                                'notes': f"En route to {event['type']}"
+                            })
+                            if current_status == 'driving':
+                                daily_logs[current_date]['total_driving_hours'] += segment_duration
+                                daily_logs[current_date]['total_on_duty_hours'] += segment_duration
+                                cycle_driving_hours += segment_duration
+                                cycle_on_duty_hours += segment_duration
+                                driving_since_last_break += segment_duration
+                                total_cycle_hours += segment_duration
+                                current_odometer += (segment_duration * AVERAGE_SPEED)
+                                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
+                                logger.info(f"Added driving before pickup on {current_date}: {segment_duration} hours")
+                            current_time = end_segment
+                current_status = 'on_duty_not_driving'
+                status_start_time = event['time']
+            
+            pickup_end_time = event['time'] + timedelta(hours=event['duration'])
+            current_time = event['time']
+            while current_time < pickup_end_time:
+                current_date = current_time.date()
+                if current_date not in daily_logs:
+                    daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                end_segment = min(next_day, pickup_end_time)
+                segment_duration = (end_segment - current_time).total_seconds() / 3600
+                log_entries.append({
+                    'start_time': current_time,
+                    'end_time': end_segment,
+                    'status': 'on_duty_not_driving',
+                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                    'activity': 'Loading',
+                    'notes': f"Loading at pickup location"
+                })
+                daily_logs[current_date]['total_on_duty_hours'] += segment_duration
+                cycle_on_duty_hours += segment_duration
+                total_cycle_hours += segment_duration
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'on_duty_not_driving')
+                current_time = end_segment
+            
+            current_status = 'driving'
+            status_start_time = pickup_end_time
+        
+        elif event['type'] in ['rest', 'fuel', 'mandatory_break']:
+            if current_status and status_start_time:
+                duration = (event['time'] - status_start_time).total_seconds() / 3600
+                if duration > 0:
+                    current_time = status_start_time
+                    while current_time < event['time']:
+                        current_date = current_time.date()
+                        if current_date not in daily_logs:
+                            daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                        next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                        end_segment = min(next_day, event['time'])
+                        segment_duration = (end_segment - current_time).total_seconds() / 3600
+                        
+                        # Enforce 11-hour driving limit
+                        if current_status == 'driving' and cycle_driving_hours + segment_duration > MAX_DRIVING_TIME:
+                            segment_duration = MAX_DRIVING_TIME - cycle_driving_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break at {end_segment}")
+                            break
+                        
+                        # Enforce 14-hour on-duty limit
+                        if cycle_on_duty_hours + segment_duration > MAX_ON_DUTY_TIME:
+                            segment_duration = MAX_ON_DUTY_TIME - cycle_on_duty_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break due to 14-hour limit at {end_segment}")
+                            break
+                        
+                        # Enforce 8-hour driving limit before a 30-minute break
+                        if current_status == 'driving' and driving_since_last_break + segment_duration > MAX_DRIVING_BEFORE_BREAK:
+                            segment_duration = MAX_DRIVING_BEFORE_BREAK - driving_since_last_break
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 30-minute break
+                            break_end = end_segment + timedelta(hours=MANDATORY_BREAK_TIME)
+                            events.insert(i + 1, {
+                                'type': 'mandatory_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_BREAK_TIME,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            driving_since_last_break = 0
+                            logger.info(f"Inserted mandatory 30-minute break at {end_segment}")
+                            break
+                        
+                        # Enforce 70-hour cycle limit
+                        if total_cycle_hours + segment_duration > MAX_CYCLE_TIME:
+                            segment_duration = MAX_CYCLE_TIME - total_cycle_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            total_cycle_hours = 0
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break due to 70-hour cycle limit at {end_segment}")
+                            break
+                        
+                        log_entries.append({
+                            'start_time': current_time,
+                            'end_time': end_segment,
+                            'status': current_status,
+                            'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                            'notes': f"Driving to {event['type']} stop"
+                        })
+                        if current_status == 'driving':
+                            daily_logs[current_date]['total_driving_hours'] += segment_duration
+                            daily_logs[current_date]['total_on_duty_hours'] += segment_duration
+                            cycle_driving_hours += segment_duration
+                            cycle_on_duty_hours += segment_duration
+                            driving_since_last_break += segment_duration
+                            total_cycle_hours += segment_duration
+                            current_odometer += (segment_duration * AVERAGE_SPEED)
+                            update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
+                            logger.info(f"Added driving before {event['type']} on {current_date}: {segment_duration} hours")
+                        current_time = end_segment
+            
+            rest_end_time = event['time'] + timedelta(hours=event['duration'])
+            current_time = event['time']
+            while current_time < rest_end_time:
+                current_date = current_time.date()
+                if current_date not in daily_logs:
+                    daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                end_segment = min(next_day, rest_end_time)
+                segment_duration = (end_segment - current_time).total_seconds() / 3600
+                log_entries.append({
+                    'start_time': current_time,
+                    'end_time': end_segment,
+                    'status': 'off_duty',
+                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                    'notes': f"{event['type'].capitalize()} stop"
+                })
+                daily_logs[current_date]['total_off_duty_hours'] += segment_duration
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'off_duty')
+                current_time = end_segment
+            
+            if event['type'] in ['rest', 'mandatory_break']:
+                driving_since_last_break = 0  # Reset the 8-hour driving counter after a break
+            
+            current_status = 'driving'
+            status_start_time = rest_end_time
+        
+        elif event['type'] == 'overnight':
+            if current_status and status_start_time:
+                duration = (event['time'] - status_start_time).total_seconds() / 3600
+                if duration > 0:
+                    current_time = status_start_time
+                    while current_time < event['time']:
+                        current_date = current_time.date()
+                        if current_date not in daily_logs:
+                            daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                        next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                        end_segment = min(next_day, event['time'])
+                        segment_duration = (end_segment - current_time).total_seconds() / 3600
+                        
+                        # Enforce 11-hour driving limit
+                        if current_status == 'driving' and cycle_driving_hours + segment_duration > MAX_DRIVING_TIME:
+                            segment_duration = MAX_DRIVING_TIME - cycle_driving_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break at {end_segment}")
+                            break
+                        
+                        # Enforce 14-hour on-duty limit
+                        if cycle_on_duty_hours + segment_duration > MAX_ON_DUTY_TIME:
+                            segment_duration = MAX_ON_DUTY_TIME - cycle_on_duty_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break due to 14-hour limit at {end_segment}")
+                            break
+                        
+                        # Enforce 8-hour driving limit before a 30-minute break
+                        if current_status == 'driving' and driving_since_last_break + segment_duration > MAX_DRIVING_BEFORE_BREAK:
+                            segment_duration = MAX_DRIVING_BEFORE_BREAK - driving_since_last_break
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 30-minute break
+                            break_end = end_segment + timedelta(hours=MANDATORY_BREAK_TIME)
+                            events.insert(i + 1, {
+                                'type': 'mandatory_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_BREAK_TIME,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            driving_since_last_break = 0
+                            logger.info(f"Inserted mandatory 30-minute break at {end_segment}")
+                            break
+                        
+                        # Enforce 70-hour cycle limit
+                        if total_cycle_hours + segment_duration > MAX_CYCLE_TIME:
+                            segment_duration = MAX_CYCLE_TIME - total_cycle_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            total_cycle_hours = 0
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break due to 70-hour cycle limit at {end_segment}")
+                            break
+                        
+                        log_entries.append({
+                            'start_time': current_time,
+                            'end_time': end_segment,
+                            'status': current_status,
+                            'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                            'notes': f"Driving to overnight stop"
+                        })
+                        if current_status == 'driving':
+                            daily_logs[current_date]['total_driving_hours'] += segment_duration
+                            daily_logs[current_date]['total_on_duty_hours'] += segment_duration
+                            cycle_driving_hours += segment_duration
+                            cycle_on_duty_hours += segment_duration
+                            driving_since_last_break += segment_duration
+                            total_cycle_hours += segment_duration
+                            current_odometer += (segment_duration * AVERAGE_SPEED)
+                            update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
+                            logger.info(f"Added driving before overnight on {current_date}: {segment_duration} hours")
+                        current_time = end_segment
+            
+            overnight_end_time = event['time'] + timedelta(hours=event['duration'])
+            current_time = event['time']
+            total_break_duration = 0
+            while current_time < overnight_end_time:
+                current_date = current_time.date()
+                if current_date not in daily_logs:
+                    daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                end_segment = min(next_day, overnight_end_time)
+                segment_duration = (end_segment - current_time).total_seconds() / 3600
+                log_entries.append({
+                    'start_time': current_time,
+                    'end_time': end_segment,
+                    'status': 'sleeper_berth',
+                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                    'notes': "Overnight stop"
+                })
+                daily_logs[current_date]['total_sleeper_berth_hours'] += segment_duration
+                total_break_duration += segment_duration
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'sleeper_berth')
+                current_time = end_segment
+            
+            # Check if the overnight stop was long enough to reset the cycle
+            if total_break_duration >= MANDATORY_RESET_BREAK:
+                cycle_driving_hours = 0
+                cycle_on_duty_hours = 0
+                driving_since_last_break = 0
+                total_cycle_hours = 0
+                last_reset_time = overnight_end_time
+                logger.info(f"Overnight stop at {event['time']} reset the duty cycle")
+            
+            current_status = 'driving'
+            status_start_time = overnight_end_time
+        
+        elif event['type'] == 'reset_break':
+            current_time = event['time']
+            break_end_time = event['time'] + timedelta(hours=event['duration'])
+            while current_time < break_end_time:
+                current_date = current_time.date()
+                if current_date not in daily_logs:
+                    daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                end_segment = min(next_day, break_end_time)
+                segment_duration = (end_segment - current_time).total_seconds() / 3600
+                log_entries.append({
+                    'start_time': current_time,
+                    'end_time': end_segment,
+                    'status': 'off_duty',
+                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                    'notes': "Mandatory HOS reset break"
+                })
+                daily_logs[current_date]['total_off_duty_hours'] += segment_duration
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'off_duty')
+                current_time = end_segment
+            
+            cycle_driving_hours = 0
+            cycle_on_duty_hours = 0
+            driving_since_last_break = 0
+            total_cycle_hours = 0
+            last_reset_time = break_end_time
+            current_status = 'driving'
+            status_start_time = break_end_time
+
+        elif event['type'] == 'dropoff':
+            if current_status and status_start_time:
+                duration = (event['time'] - status_start_time).total_seconds() / 3600
+                if duration > 0:
+                    current_time = status_start_time
+                    while current_time < event['time']:
+                        current_date = current_time.date()
+                        if current_date not in daily_logs:
+                            daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                        next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                        end_segment = min(next_day, event['time'])
+                        segment_duration = (end_segment - current_time).total_seconds() / 3600
+                        
+                        # Enforce 11-hour driving limit
+                        if current_status == 'driving' and cycle_driving_hours + segment_duration > MAX_DRIVING_TIME:
+                            segment_duration = MAX_DRIVING_TIME - cycle_driving_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break at {end_segment}")
+                            break
+                        
+                        # Enforce 14-hour on-duty limit
+                        if cycle_on_duty_hours + segment_duration > MAX_ON_DUTY_TIME:
+                            segment_duration = MAX_ON_DUTY_TIME - cycle_on_duty_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break due to 14-hour limit at {end_segment}")
+                            break
+                        
+                        # Enforce 8-hour driving limit before a 30-minute break
+                        if current_status == 'driving' and driving_since_last_break + segment_duration > MAX_DRIVING_BEFORE_BREAK:
+                            segment_duration = MAX_DRIVING_BEFORE_BREAK - driving_since_last_break
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 30-minute break
+                            break_end = end_segment + timedelta(hours=MANDATORY_BREAK_TIME)
+                            events.insert(i + 1, {
+                                'type': 'mandatory_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_BREAK_TIME,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            driving_since_last_break = 0
+                            logger.info(f"Inserted mandatory 30-minute break at {end_segment}")
+                            break
+                        
+                        # Enforce 70-hour cycle limit
+                        if total_cycle_hours + segment_duration > MAX_CYCLE_TIME:
+                            segment_duration = MAX_CYCLE_TIME - total_cycle_hours
+                            end_segment = current_time + timedelta(hours=segment_duration)
+                            # Insert a mandatory 10-hour reset break
+                            break_end = end_segment + timedelta(hours=MANDATORY_RESET_BREAK)
+                            events.insert(i + 1, {
+                                'type': 'reset_break',
+                                'time': end_segment,
+                                'duration': MANDATORY_RESET_BREAK,
+                                'location': event['location']
+                            })
+                            events.sort(key=lambda x: x['time'])
+                            total_cycle_hours = 0
+                            cycle_driving_hours = 0
+                            cycle_on_duty_hours = 0
+                            driving_since_last_break = 0
+                            last_reset_time = break_end
+                            logger.info(f"Inserted mandatory 10-hour reset break due to 70-hour cycle limit at {end_segment}")
+                            break
+                        
+                        log_entries.append({
+                            'start_time': current_time,
+                            'end_time': end_segment,
+                            'status': current_status,
+                            'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                            'notes': f"Driving to dropoff"
+                        })
+                        if current_status == 'driving':
+                            daily_logs[current_date]['total_driving_hours'] += segment_duration
+                            daily_logs[current_date]['total_on_duty_hours'] += segment_duration
+                            cycle_driving_hours += segment_duration
+                            cycle_on_duty_hours += segment_duration
+                            driving_since_last_break += segment_duration
+                            total_cycle_hours += segment_duration
+                            current_odometer += (segment_duration * AVERAGE_SPEED)
+                            update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
+                            logger.info(f"Added driving before dropoff on {current_date}: {segment_duration} hours")
+                        current_time = end_segment
+            
+            dropoff_end_time = event['time'] + timedelta(hours=event['duration'])
+            current_time = event['time']
+            while current_time < dropoff_end_time:
+                current_date = current_time.date()
+                if current_date not in daily_logs:
+                    daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
+                end_segment = min(next_day, dropoff_end_time)
+                segment_duration = (end_segment - current_time).total_seconds() / 3600
+                log_entries.append({
+                    'start_time': current_time,
+                    'end_time': end_segment,
+                    'status': 'on_duty_not_driving',
+                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                    'activity': 'Unloading',
+                    'notes': f"Unloading at delivery location"
+                })
+                daily_logs[current_date]['total_on_duty_hours'] += segment_duration
+                cycle_on_duty_hours += segment_duration
+                total_cycle_hours += segment_duration
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'on_duty_not_driving')
+                current_time = end_segment
+            
+            current_status = 'off_duty'
+            status_start_time = dropoff_end_time
+    
+    # Finalize daily logs
+    daily_logs_list = []
+    for date in sorted(daily_logs.keys()):
+        daily_log = daily_logs[date]
+        daily_log['ending_odometer'] = calculate_odometer(daily_log['starting_odometer'], daily_log['total_driving_hours'])
+        daily_logs_list.append(daily_log)
+    
+    total_on_duty_hours = sum(log['total_on_duty_hours'] for log in daily_logs_list)
+    logger.info(f"Generated {len(log_entries)} log entries and {len(daily_logs_list)} daily logs for trip {trip.id}")
+    
+    return {
+        'message': "ELD logs generated successfully",
+        'total_on_duty_hours': total_on_duty_hours,
+        'daily_logs': daily_logs_list,
+        'log_entries': log_entries,
+    }
+
+def initialize_log_grid():
+    """Initialize a log grid with 15-minute intervals for a 24-hour day."""
+    return [{'time': minute, 'status': None} for minute in range(0, 1440, 15)]
+
+def update_log_grid(log_data, start_time, end_time, status):
+    """Update the log grid with the given status between start_time and end_time."""
+    start_minutes = start_time.hour * 60 + start_time.minute
+    end_minutes = end_time.hour * 60 + end_time.minute
+    if start_time.date() != end_time.date():
+        end_minutes = 1440  # End of the day for start_time's date
+    
+    start_index = start_minutes // 15
+    end_index = end_minutes // 15
+    
+    for i in range(start_index, min(end_index, len(log_data))):
+        log_data[i]['status'] = status
+
+def calculate_odometer(starting_odometer, driving_hours):
+    """Calculate the ending odometer based on driving hours (assuming 55 mph)."""
+    miles_driven = driving_hours * AVERAGE_SPEED
+    return int(starting_odometer + miles_driven)
+
+def initialize_daily_log(current_date, previous_date=None, daily_logs=None):
+    """Helper function to initialize a daily log entry with all required keys."""
+    starting_odometer = 0
+    if previous_date and daily_logs and previous_date in daily_logs:
+        starting_odometer = daily_logs[previous_date]['ending_odometer']
+    
+    return {
         'date': current_date,
-        'starting_odometer': 0,  # Would be calculated in production
+        'starting_odometer': starting_odometer,
         'ending_odometer': 0,
         'total_driving_hours': 0,
         'total_on_duty_hours': 0,
@@ -290,300 +1087,3 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
         'total_sleeper_berth_hours': 0,
         'log_data': initialize_log_grid()
     }
-    
-    # Process each event chronologically
-    for i, event in enumerate(events):
-        # If this is the first event, add driving time from trip start to first event
-        if i == 0 and event['type'] == 'pickup':
-            # Driver is driving from current location to pickup
-            driving_duration = (event['time'] - trip.start_time).total_seconds() / 3600
-            
-            # Add driving log entry
-            log_entries.append({
-                'start_time': trip.start_time,
-                'end_time': event['time'],
-                'status': 'driving',
-                'location_id': trip.current_location.id,
-                'notes': f"Driving to pickup location"
-            })
-            
-            # Update daily log
-            daily_log['total_driving_hours'] += driving_duration
-            update_log_grid(daily_log['log_data'], trip.start_time, event['time'], 'driving')
-            
-            current_status = 'driving'
-            status_start_time = trip.start_time
-        
-        # Process event based on type
-        if event['type'] == 'pickup':
-            # Change status to on_duty_not_driving for pickup
-            if current_status != 'on_duty_not_driving':
-                # End previous status
-                if current_status and status_start_time:
-                    log_entries.append({
-                        'start_time': status_start_time,
-                        'end_time': event['time'],
-                        'status': current_status,
-                        'location_id': event['location'].id,
-                        'notes': f"En route to {event['type']}"
-                    })
-                
-                # Update daily log
-                if current_status == 'driving':
-                    duration = (event['time'] - status_start_time).total_seconds() / 3600
-                    daily_log['total_driving_hours'] += duration
-                    update_log_grid(daily_log['log_data'], status_start_time, event['time'], 'driving')
-                
-                # Start new status
-                current_status = 'on_duty_not_driving'
-                status_start_time = event['time']
-            
-            # Add on-duty log entry for pickup
-            pickup_end_time = event['time'] + timedelta(hours=event['duration'])
-            log_entries.append({
-                'start_time': event['time'],
-                'end_time': pickup_end_time,
-                'status': 'on_duty_not_driving',
-                'location_id': event['location'].id,
-                'activity': 'Loading',
-                'notes': f"Loading at pickup location"
-            })
-            
-            # Update daily log
-            daily_log['total_on_duty_hours'] += event['duration']
-            update_log_grid(daily_log['log_data'], event['time'], pickup_end_time, 'on_duty_not_driving')
-            
-            # After pickup, driver starts driving
-            current_status = 'driving'
-            status_start_time = pickup_end_time
-            
-        elif event['type'] == 'rest':
-            # End previous status
-            if current_status and status_start_time:
-                log_entries.append({
-                    'start_time': status_start_time,
-                    'end_time': event['time'],
-                    'status': current_status,
-                    'location_id': event['location'].id
-                })
-                
-                # Update daily log
-                if current_status == 'driving':
-                    duration = (event['time'] - status_start_time).total_seconds() / 3600
-                    daily_log['total_driving_hours'] += duration
-                    update_log_grid(daily_log['log_data'], status_start_time, event['time'], 'driving')
-            
-            # Add off-duty log entry for rest
-            rest_end_time = event['time'] + timedelta(hours=event['duration'])
-            log_entries.append({
-                'start_time': event['time'],
-                'end_time': rest_end_time,
-                'status': 'off_duty',
-                'location_id': event['location'].id,
-                'notes': f"Mandatory rest break"
-            })
-            
-            # Update daily log
-            daily_log['total_off_duty_hours'] += event['duration']
-            update_log_grid(daily_log['log_data'], event['time'], rest_end_time, 'off_duty')
-            
-            # After rest, driver starts driving again
-            current_status = 'driving'
-            status_start_time = rest_end_time
-            
-        elif event['type'] == 'fuel':
-            # End previous status
-            if current_status and status_start_time:
-                log_entries.append({
-                    'start_time': status_start_time,
-                    'end_time': event['time'],
-                    'status': current_status,
-                    'location_id': event['location'].id
-                })
-                
-                # Update daily log
-                if current_status == 'driving':
-                    duration = (event['time'] - status_start_time).total_seconds() / 3600
-                    daily_log['total_driving_hours'] += duration
-                    update_log_grid(daily_log['log_data'], status_start_time, event['time'], 'driving')
-            
-            # Add on-duty log entry for fueling
-            fuel_end_time = event['time'] + timedelta(hours=event['duration'])
-            log_entries.append({
-                'start_time': event['time'],
-                'end_time': fuel_end_time,
-                'status': 'on_duty_not_driving',
-                'location_id': event['location'].id,
-                'activity': 'Fueling',
-                'notes': f"Fuel stop"
-            })
-            
-            # Update daily log
-            daily_log['total_on_duty_hours'] += event['duration']
-            update_log_grid(daily_log['log_data'], event['time'], fuel_end_time, 'on_duty_not_driving')
-            
-            # After fueling, driver starts driving again
-            current_status = 'driving'
-            status_start_time = fuel_end_time
-            
-        elif event['type'] == 'overnight':
-            # End previous status
-            if current_status and status_start_time:
-                log_entries.append({
-                    'start_time': status_start_time,
-                    'end_time': event['time'],
-                    'status': current_status,
-                    'location_id': event['location'].id
-                })
-                
-                # Update daily log
-                if current_status == 'driving':
-                    duration = (event['time'] - status_start_time).total_seconds() / 3600
-                    daily_log['total_driving_hours'] += duration
-                    update_log_grid(daily_log['log_data'], status_start_time, event['time'], 'driving')
-            
-            # Add sleeper berth log entry for overnight rest
-            overnight_end_time = event['time'] + timedelta(hours=event['duration'])
-            log_entries.append({
-                'start_time': event['time'],
-                'end_time': overnight_end_time,
-                'status': 'sleeper_berth',
-                'location_id': event['location'].id,
-                'notes': f"10-hour reset"
-            })
-            
-            # Check if rest period spans multiple days
-            if event['time'].date() != overnight_end_time.date():
-                # Finalize current day's log
-                daily_log['ending_odometer'] = calculate_odometer(0, daily_log['total_driving_hours'])
-                daily_logs.append(daily_log)
-                
-                # Create new daily log for the next day
-                current_date = overnight_end_time.date()
-                daily_log = {
-                    'date': current_date,
-                    'starting_odometer': daily_log['ending_odometer'],
-                    'ending_odometer': 0,
-                    'total_driving_hours': 0,
-                    'total_on_duty_hours': 0,
-                    'total_off_duty_hours': 0,
-                    'total_sleeper_berth_hours': 0,
-                    'log_data': initialize_log_grid()
-                }
-            
-            # Calculate how much sleeper berth time falls on each day
-            current_time = event['time']
-            while current_time < overnight_end_time:
-                next_day = datetime.combine(current_time.date() + timedelta(days=1), time.min)
-                end_segment = min(next_day, overnight_end_time)
-                
-                segment_duration = (end_segment - current_time).total_seconds() / 3600
-                daily_log['total_sleeper_berth_hours'] += segment_duration
-                update_log_grid(daily_log['log_data'], current_time, end_segment, 'sleeper_berth')
-                
-                if end_segment < overnight_end_time:
-                    # Finalize this day's log
-                    daily_log['ending_odometer'] = calculate_odometer(daily_log['starting_odometer'], daily_log['total_driving_hours'])
-                    daily_logs.append(daily_log)
-                    
-                    # Create new log for next day
-                    current_date = end_segment.date()
-                    daily_log = {
-                        'date': current_date,
-                        'starting_odometer': daily_log['ending_odometer'],
-                        'ending_odometer': 0,
-                        'total_driving_hours': 0,
-                        'total_on_duty_hours': 0,
-                        'total_off_duty_hours': 0,
-                        'total_sleeper_berth_hours': 0,
-                        'log_data': initialize_log_grid()
-                    }
-                
-                current_time = end_segment
-            
-            # After overnight rest, driver starts driving again
-            current_status = 'driving'
-            status_start_time = overnight_end_time
-            
-        elif event['type'] == 'dropoff':
-            # End previous status
-            if current_status and status_start_time:
-                log_entries.append({
-                    'start_time': status_start_time,
-                    'end_time': event['time'],
-                    'status': current_status,
-                    'location_id': event['location'].id
-                })
-                
-                # Update daily log
-                if current_status == 'driving':
-                    duration = (event['time'] - status_start_time).total_seconds() / 3600
-                    daily_log['total_driving_hours'] += duration
-                    update_log_grid(daily_log['log_data'], status_start_time, event['time'], 'driving')
-            
-            # Add on-duty log entry for dropoff
-            dropoff_end_time = event['time'] + timedelta(hours=event['duration'])
-            log_entries.append({
-                'start_time': event['time'],
-                'end_time': dropoff_end_time,
-                'status': 'on_duty_not_driving',
-                'location_id': event['location'].id,
-                'activity': 'Unloading',
-                'notes': f"Unloading at delivery location"
-            })
-            
-            # Update daily log
-            daily_log['total_on_duty_hours'] += event['duration']
-            update_log_grid(daily_log['log_data'], event['time'], dropoff_end_time, 'on_duty_not_driving')
-            
-            # After dropoff, trip is complete
-            current_status = 'off_duty'
-            status_start_time = dropoff_end_time
-    
-    # Finalize the last daily log
-    daily_log['ending_odometer'] = calculate_odometer(daily_log['starting_odometer'], daily_log['total_driving_hours'])
-    daily_logs.append(daily_log)
-    
-    logger.info(f"Generated {len(log_entries)} log entries and {len(daily_logs)} daily logs for trip {trip.id}")
-    
-    return {
-        'log_entries': log_entries,
-        'daily_logs': daily_logs
-    }
-
-def initialize_log_grid():
-    """Initialize a 24-hour log grid with 15-minute intervals"""
-    grid = []
-    for hour in range(24):
-        for minute in range(0, 60, 15):
-            timestamp = hour * 100 + minute if minute > 0 else hour * 100
-            grid.append({
-                'time': timestamp,
-                'status': None
-            })
-    return grid
-
-def update_log_grid(grid, start_time, end_time, status):
-    """Update log grid with status for the given time period"""
-    # Convert datetime to grid time format (HHMM)
-    start_grid_time = start_time.hour * 100 + (start_time.minute // 15) * 15
-    end_grid_time = end_time.hour * 100 + (end_time.minute // 15) * 15
-    
-    # Handle overnight periods
-    if start_time.date() != end_time.date():
-        # Update until end of day
-        for cell in grid:
-            if cell['time'] >= start_grid_time and cell['time'] <= 2345:
-                cell['status'] = status
-        return
-    
-    # Update grid cells within the time range
-    for cell in grid:
-        if cell['time'] >= start_grid_time and cell['time'] <= end_grid_time:
-            cell['status'] = status
-
-def calculate_odometer(starting_odometer, driving_hours):
-    """Calculate ending odometer based on driving hours (assuming avg speed of 55 mph)"""
-    avg_speed = 55  # mph
-    distance_driven = driving_hours * avg_speed
-    return starting_odometer + round(distance_driven)

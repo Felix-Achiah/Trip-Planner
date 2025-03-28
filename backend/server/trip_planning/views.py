@@ -9,6 +9,8 @@ import json
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from django.utils import timezone
+import logging
 
 from .models import Trip, Route, Location, Waypoint, LogEntry, DailyLog
 from .serializers import (
@@ -23,6 +25,8 @@ from .services import (
 
 # Load environment variables
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 class LocationViewSet(viewsets.ModelViewSet):
     """ViewSet for Location CRUD operations"""
@@ -106,6 +110,7 @@ class TripViewSet(viewsets.ModelViewSet):
                 dropoff_location=(trip.dropoff_location.latitude, trip.dropoff_location.longitude),
                 current_cycle_hours=trip.current_cycle_hours
             )
+            route_data['start_time'] = trip.start_time
         except Exception as e:
             return Response({'error': f'Route calculation failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
@@ -129,12 +134,14 @@ class TripViewSet(viewsets.ModelViewSet):
             rest_stops = calculate_rest_stops(route_data=route_data, current_cycle_hours=trip.current_cycle_hours)
             
             sequence = 0
+            # Calculate pickup arrival time based on driving from current_location to pickup_location
+            pickup_arrival = trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600)
             Waypoint.objects.create(
                 route=route,
                 location=trip.pickup_location,
                 waypoint_type='pickup',
                 sequence=sequence,
-                estimated_arrival=trip.start_time,
+                estimated_arrival=pickup_arrival,
                 planned_duration=1.0
             )
             sequence += 1
@@ -184,43 +191,58 @@ class TripViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def generate_logs(self, request, pk=None):
-        """Generate ELD logs for the trip"""
-        trip = self.get_object()  
+        logger.info(f"Starting generate_logs for trip ID {pk} by user {request.user.id}")
+        trip = self.get_object()
+        user = request.user
+        
+        logger.info(f"Retrieved trip: {trip.id}, start_time: {trip.start_time}, current_cycle_hours: {trip.current_cycle_hours}")
         
         try:
-            if not hasattr(trip, 'route'):
-                return Response(
-                    {'error': 'Route must be calculated before generating logs'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Delete existing logs
-            trip.log_entries.all().delete()
-            trip.daily_logs.all().delete()
-            
-            # Call service to generate logs, passing the authenticated user
+            route = Route.objects.get(trip=trip)
+            logger.info(f"Retrieved route for trip {trip.id}: total_distance={route.total_distance}, estimated_driving_time={route.estimated_driving_time}")
+        except Route.DoesNotExist:
+            logger.warning(f"No route found for trip {trip.id}")
+            return Response({'error': 'Route must be calculated before generating logs'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        waypoints = route.waypoints.all()
+        if not waypoints.exists():
+            logger.warning(f"No waypoints found for route of trip {trip.id}")
+            return Response({'error': 'No waypoints found for the route'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        logger.info(f"Found {waypoints.count()} waypoints for trip {trip.id}")
+        for waypoint in waypoints:
+            logger.info(f"Waypoint: type={waypoint.waypoint_type}, sequence={waypoint.sequence}, estimated_arrival={waypoint.estimated_arrival}, planned_duration={waypoint.planned_duration}")
+        
+        try:
             logs_data = generate_eld_logs_service(
                 trip=trip,
-                route=trip.route,
-                waypoints=trip.route.waypoints.all(),
+                route=route,
+                waypoints=waypoints,
                 current_cycle_hours=trip.current_cycle_hours,
-                user=request.user  # Pass the authenticated user
+                user=user
             )
-            
-            # Create log entries
-            for log_entry in logs_data['log_entries']:
+            logger.info(f"Generated logs_data: {logs_data}")
+        except Exception as e:
+            logger.error(f"Error generating ELD logs for trip {trip.id}: {str(e)}", exc_info=True)
+            return Response({'error': f'Log generation failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        try:
+            logger.info(f"Saving {len(logs_data['log_entries'])} log entries for trip {trip.id}")
+            for entry in logs_data['log_entries']:
+                logger.debug(f"Saving LogEntry: {entry}")
                 LogEntry.objects.create(
                     trip=trip,
-                    start_time=log_entry['start_time'],
-                    end_time=log_entry['end_time'],
-                    status=log_entry['status'],
-                    location_id=log_entry.get('location_id'),
-                    activity=log_entry.get('activity'),
-                    notes=log_entry.get('notes')
+                    start_time=entry['start_time'],
+                    end_time=entry['end_time'],
+                    status=entry['status'],
+                    location_id=entry.get('location_id'),
+                    activity=entry.get('activity', ''),
+                    notes=entry.get('notes', '')
                 )
             
-            # Create daily logs
+            logger.info(f"Saving {len(logs_data['daily_logs'])} daily logs for trip {trip.id}")
             for daily_log in logs_data['daily_logs']:
+                logger.debug(f"Saving DailyLog: {daily_log}")
                 DailyLog.objects.create(
                     trip=trip,
                     date=daily_log['date'],
@@ -233,12 +255,16 @@ class TripViewSet(viewsets.ModelViewSet):
                     log_data=daily_log['log_data']
                 )
             
+            total_on_duty_hours = sum(log['total_on_duty_hours'] for log in logs_data['daily_logs'])
+            logger.info(f"Successfully generated and saved logs for trip {trip.id}, total_on_duty_hours={total_on_duty_hours}")
             return Response({
                 'message': 'ELD logs generated successfully',
-                'daily_logs': DailyLogSerializer(trip.daily_logs.all(), many=True).data
+                'total_on_duty_hours': total_on_duty_hours,
+                'daily_logs': logs_data['daily_logs']
             })
         except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.error(f"Error saving ELD logs for trip {trip.id}: {str(e)}", exc_info=True)
+            return Response({'error': f'Failed to save logs: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class RouteViewSet(viewsets.ReadOnlyModelViewSet):
