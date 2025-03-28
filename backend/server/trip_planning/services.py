@@ -40,7 +40,25 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
         
     Returns:
         dict: Route data including total distance, driving time, and route details
+        
+    Raises:
+        ValueError: If coordinates are invalid
+        Exception: If Mapbox API call fails or no routes are found
     """
+    # Validate coordinates
+    for location, name in [
+        (current_location, "current_location"),
+        (pickup_location, "pickup_location"),
+        (dropoff_location, "dropoff_location")
+    ]:
+        if not isinstance(location, (tuple, list)) or len(location) != 2:
+            raise ValueError(f"Invalid {name}: must be a tuple of (latitude, longitude)")
+        lat, lng = location
+        if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+            raise ValueError(f"Invalid {name} coordinates: latitude must be [-90, 90], longitude must be [-180, 180]")
+        if lat is None or lng is None:
+            raise ValueError(f"Invalid {name} coordinates: latitude and longitude must not be None")
+
     # Create waypoints for the route
     waypoints = [
         f"{current_location[1]},{current_location[0]}",  # Format is lng,lat for Mapbox
@@ -55,10 +73,16 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
         'overview': 'full',
         'steps': 'true'
     }
-    response = requests.get(url, params=params)
+    try:
+        response = requests.get(url, params=params, timeout=10)
+    except requests.RequestException as e:
+        logger.error(f"Mapbox API request failed: {str(e)}")
+        raise Exception(f"Mapbox API request failed: {str(e)}")
+
     if response.status_code != 200:
         logger.error(f"Mapbox API error: {response.status_code} - {response.text}")
         raise Exception(f"Mapbox API error: {response.status_code} - {response.text}")
+    
     data = response.json()
     if not data.get('routes'):
         logger.error("No routes found in Mapbox response")
@@ -72,24 +96,32 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
     total_driving_time_hours = route_data['duration'] / 3600  # Convert seconds to hours
     
     # Adjust driving time based on AVERAGE_SPEED if necessary
-    mapbox_speed_mph = total_distance_miles / total_driving_time_hours if total_driving_time_hours > 0 else AVERAGE_SPEED
-    if mapbox_speed_mph > AVERAGE_SPEED:
+    if total_driving_time_hours <= 0:
+        logger.warning("Mapbox returned a zero or negative duration; using distance-based estimate")
         total_driving_time_hours = total_distance_miles / AVERAGE_SPEED
+    else:
+        mapbox_speed_mph = total_distance_miles / total_driving_time_hours
+        if mapbox_speed_mph > AVERAGE_SPEED:
+            total_driving_time_hours = total_distance_miles / AVERAGE_SPEED
     
     # Create segments for easier processing
     segments = []
+    coordinates = route_data['geometry']['coordinates']
     for i, leg in enumerate(route_data['legs']):
+        if i + 1 >= len(coordinates):
+            logger.error(f"Insufficient coordinates for segment {i}: expected {i+1} coordinates, got {len(coordinates)}")
+            raise Exception(f"Insufficient coordinates for segment {i}")
         segment_distance = leg['distance'] / 1609.34  # Convert to miles
         segment_duration = leg['duration'] / 3600  # Convert to hours
         # Adjust segment duration based on AVERAGE_SPEED
-        if mapbox_speed_mph > AVERAGE_SPEED:
+        if total_driving_time_hours > 0 and mapbox_speed_mph > AVERAGE_SPEED:
             segment_duration = segment_distance / AVERAGE_SPEED
         segment = {
             'index': i,
             'distance': segment_distance,
             'duration': segment_duration,
-            'start_coord': route_data['geometry']['coordinates'][i],
-            'end_coord': route_data['geometry']['coordinates'][i+1]
+            'start_coord': coordinates[i],
+            'end_coord': coordinates[i + 1]
         }
         segments.append(segment)
     
