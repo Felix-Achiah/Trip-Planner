@@ -4,7 +4,7 @@ import axios from 'axios';
 // https://trip-planner-backend-azure.vercel.app/api
 
 // Base url
-const API_URL = 'http://127.0.0.1:8000/api';
+const API_URL = 'https://trip-planner-backend-azure.vercel.app/api';
 
 const api = axios.create({
   baseURL: API_URL,
