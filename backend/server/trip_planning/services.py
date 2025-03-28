@@ -48,7 +48,6 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
         f"{dropoff_location[1]},{dropoff_location[0]}"
     ]
     
-    
     url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{';'.join(waypoints)}"
     params = {
         'access_token': MAPBOX_API_KEY,
@@ -58,25 +57,37 @@ def calculate_route_service(current_location, pickup_location, dropoff_location,
     }
     response = requests.get(url, params=params)
     if response.status_code != 200:
+        logger.error(f"Mapbox API error: {response.status_code} - {response.text}")
         raise Exception(f"Mapbox API error: {response.status_code} - {response.text}")
     data = response.json()
     if not data.get('routes'):
+        logger.error("No routes found in Mapbox response")
         raise Exception("No routes found in Mapbox response")
     
     # Extract route data
     route_data = data['routes'][0]
     
-    # Convert to miles and hours for the application
-    total_distance_miles = route_data['distance'] / 1609.34
-    total_driving_time_hours = route_data['duration'] / 3600
+    # Convert to miles and hours
+    total_distance_miles = route_data['distance'] / 1609.34  # Convert meters to miles
+    total_driving_time_hours = route_data['duration'] / 3600  # Convert seconds to hours
+    
+    # Adjust driving time based on AVERAGE_SPEED if necessary
+    mapbox_speed_mph = total_distance_miles / total_driving_time_hours if total_driving_time_hours > 0 else AVERAGE_SPEED
+    if mapbox_speed_mph > AVERAGE_SPEED:
+        total_driving_time_hours = total_distance_miles / AVERAGE_SPEED
     
     # Create segments for easier processing
     segments = []
     for i, leg in enumerate(route_data['legs']):
+        segment_distance = leg['distance'] / 1609.34  # Convert to miles
+        segment_duration = leg['duration'] / 3600  # Convert to hours
+        # Adjust segment duration based on AVERAGE_SPEED
+        if mapbox_speed_mph > AVERAGE_SPEED:
+            segment_duration = segment_distance / AVERAGE_SPEED
         segment = {
             'index': i,
-            'distance': leg['distance'] / 1609.34,  # Convert to miles
-            'duration': leg['duration'] / 3600,  # Convert to hours
+            'distance': segment_distance,
+            'duration': segment_duration,
             'start_coord': route_data['geometry']['coordinates'][i],
             'end_coord': route_data['geometry']['coordinates'][i+1]
         }
@@ -107,13 +118,14 @@ def interpolate_coordinates(start_coord, end_coord, fraction):
     interpolated_lat = start_lat + (end_lat - start_lat) * fraction
     return (interpolated_lon, interpolated_lat)
 
-def calculate_rest_stops(route_data, current_cycle_hours):
+def calculate_rest_stops(route_data, current_cycle_hours, trip_start_time):
     """
     Calculate rest stops based on route data and HOS regulations.
     
     Args:
         route_data (dict): Route data from calculate_route_service
         current_cycle_hours (float): Current cycle hours used
+        trip_start_time (datetime): The trip's start time
         
     Returns:
         list: List of rest stops (rest, fuel, overnight)
@@ -121,11 +133,14 @@ def calculate_rest_stops(route_data, current_cycle_hours):
     segments = route_data['segments']
     total_distance = route_data['total_distance']
     
-    # Start time (should ideally be the trip's start time, but using datetime.now() as per original code)
-    current_time = datetime.now()
-    remaining_drive_time = MAX_DRIVING_TIME
-    remaining_on_duty_time = MAX_ON_DUTY_TIME
-    remaining_cycle_time = MAX_CYCLE_TIME - current_cycle_hours
+    # Ensure trip_start_time is timezone-aware
+    current_time = trip_start_time
+    if not django_timezone.is_aware(current_time):
+        current_time = django_timezone.make_aware(current_time, timezone=timezone.utc)
+
+    remaining_drive_time = MAX_DRIVING_TIME  # 11 hours
+    remaining_on_duty_time = MAX_ON_DUTY_TIME  # 14 hours
+    remaining_cycle_time = MAX_CYCLE_TIME - current_cycle_hours  # 70 - 2 = 68
     time_since_break = 0
     distance_since_fuel = 0
     
@@ -139,11 +154,10 @@ def calculate_rest_stops(route_data, current_cycle_hours):
             current_position = segment['start_coord']
             # Account for pickup time
             current_time += timedelta(hours=PICKUP_DROPOFF_TIME)
-            remaining_on_duty_time -= PICKUP_DROPOFF_TIME
-            remaining_cycle_time -= PICKUP_DROPOFF_TIME
+            remaining_on_duty_time -= PICKUP_DROPOFF_TIME  # 14 - 1 = 13
+            remaining_cycle_time -= PICKUP_DROPOFF_TIME  # 68 - 1 = 67
             current_position = segment['end_coord']
             if remaining_on_duty_time <= 0 or remaining_cycle_time <= 0:
-                # Insert an overnight stop immediately after pickup if HOS limits are exceeded
                 rest_stops.append({
                     'name': f"Overnight Rest {len(rest_stops) + 1}",
                     'type': 'overnight',
@@ -155,7 +169,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 current_time += timedelta(hours=MANDATORY_RESET_BREAK)
                 remaining_drive_time = MAX_DRIVING_TIME
                 remaining_on_duty_time = MAX_ON_DUTY_TIME
-                remaining_cycle_time = MAX_CYCLE_TIME  # Reset cycle time after a 10-hour break
+                remaining_cycle_time = MAX_CYCLE_TIME
                 time_since_break = 0
                 distance_since_fuel = 0
                 logger.info(f"Added overnight stop after pickup due to HOS limits")
@@ -164,19 +178,17 @@ def calculate_rest_stops(route_data, current_cycle_hours):
         segment_time = segment['duration']
         start_coord = segment['start_coord']
         end_coord = segment['end_coord']
-        distance_covered = 0  # Track distance covered within the segment
+        distance_covered = 0
         
         logger.info(f"Segment {i}: distance={possible_distance}, time={segment_time}, time_since_break={time_since_break}")
         
         while segment_time > 0:
-            # Calculate the time and distance that can be driven before hitting any HOS limit
             time_before_break = max(0, MAX_DRIVING_BEFORE_BREAK - time_since_break)
             time_before_fuel = max(0, (MAX_DISTANCE_BEFORE_FUEL - distance_since_fuel) / AVERAGE_SPEED)
             time_before_drive_limit = max(0, remaining_drive_time)
             time_before_duty_limit = max(0, remaining_on_duty_time)
             time_before_cycle_limit = max(0, remaining_cycle_time)
             
-            # Find the earliest limit that will be hit
             drive_time = min(
                 segment_time,
                 time_before_break,
@@ -187,7 +199,6 @@ def calculate_rest_stops(route_data, current_cycle_hours):
             )
             
             if drive_time <= 0:
-                # If no driving is possible due to HOS limits, insert an overnight stop
                 fraction = distance_covered / possible_distance if possible_distance > 0 else 0
                 current_position = interpolate_coordinates(start_coord, end_coord, fraction)
                 rest_stops.append({
@@ -201,19 +212,17 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 current_time += timedelta(hours=MANDATORY_RESET_BREAK)
                 remaining_drive_time = MAX_DRIVING_TIME
                 remaining_on_duty_time = MAX_ON_DUTY_TIME
-                remaining_cycle_time = MAX_CYCLE_TIME  # Reset cycle time after a 10-hour break
+                remaining_cycle_time = MAX_CYCLE_TIME
                 time_since_break = 0
                 distance_since_fuel = 0
                 logger.info(f"Added overnight stop: remaining_segment_time={segment_time}")
                 continue
             
-            # Drive for the allowed time
             drive_distance = (drive_time / segment_time) * possible_distance if segment_time > 0 else 0
             distance_covered += drive_distance
             fraction = distance_covered / possible_distance if possible_distance > 0 else 0
             current_position = interpolate_coordinates(start_coord, end_coord, fraction)
             
-            # Check which limit was hit and insert the appropriate stop
             if time_since_break + drive_time >= MAX_DRIVING_BEFORE_BREAK:
                 rest_stops.append({
                     'name': f"Rest Break {len(rest_stops) + 1}",
@@ -266,7 +275,7 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 current_time += timedelta(hours=drive_time + MANDATORY_RESET_BREAK)
                 remaining_drive_time = MAX_DRIVING_TIME
                 remaining_on_duty_time = MAX_ON_DUTY_TIME
-                remaining_cycle_time = MAX_CYCLE_TIME  # Reset cycle time after a 10-hour break
+                remaining_cycle_time = MAX_CYCLE_TIME
                 time_since_break = 0
                 distance_since_fuel = 0
                 segment_time -= drive_time
@@ -274,7 +283,6 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 logger.info(f"Added overnight stop: remaining_segment_time={segment_time}")
             
             else:
-                # No limits hit, complete the segment
                 current_time += timedelta(hours=drive_time)
                 time_since_break += drive_time
                 remaining_drive_time -= drive_time
@@ -287,11 +295,9 @@ def calculate_rest_stops(route_data, current_cycle_hours):
                 logger.info(f"Completed segment: time_since_break={time_since_break}")
     
     if segments:
-        # Account for dropoff time
         remaining_on_duty_time -= PICKUP_DROPOFF_TIME
         remaining_cycle_time -= PICKUP_DROPOFF_TIME
         if remaining_on_duty_time <= 0 or remaining_cycle_time <= 0:
-            # Insert an overnight stop after dropoff if HOS limits are exceeded
             rest_stops.append({
                 'name': f"Overnight Rest {len(rest_stops) + 1}",
                 'type': 'overnight',
@@ -349,8 +355,6 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     # Ensure trip.start_time is timezone-aware
     trip_start_time = django_timezone.make_aware(trip.start_time) if not django_timezone.is_aware(trip.start_time) else trip.start_time
     current_time = trip_start_time
-    # Set end time to March 29, 09:30 UTC (end of dropoff)
-    end_log_time = datetime(2025, 3, 29, 9, 30, tzinfo=timezone.utc)
 
     # Convert waypoints to chronological list of events
     events = []
@@ -394,6 +398,9 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     # Sort events by time
     events.sort(key=lambda x: x['time'])
     logger.info(f"Events to process: {events}")
+
+    # Set end_log_time to after the dropoff
+    end_log_time = dropoff_time + timedelta(hours=dropoff_waypoint.planned_duration)
 
     # Step 1: Handle pre-pickup period
     if events and events[0]['time'] > trip_start_time:
