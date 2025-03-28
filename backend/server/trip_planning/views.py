@@ -9,7 +9,7 @@ import json
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from django.utils import timezone as django_timezone
+from django.utils import timezone
 import logging
 
 from .models import Trip, Route, Location, Waypoint, LogEntry, DailyLog
@@ -104,56 +104,38 @@ class TripViewSet(viewsets.ModelViewSet):
         trip = self.get_object()  # This will automatically respect the user filter
         
         try:
-            # Ensure coordinates are valid
-            current_location = (trip.current_location.latitude, trip.current_location.longitude)
-            pickup_location = (trip.pickup_location.latitude, trip.pickup_location.longitude)
-            dropoff_location = (trip.dropoff_location.latitude, trip.dropoff_location.longitude)
-            
             route_data = calculate_route_service(
-                current_location=current_location,
-                pickup_location=pickup_location,
-                dropoff_location=dropoff_location,
+                current_location=(trip.current_location.latitude, trip.current_location.longitude),
+                pickup_location=(trip.pickup_location.latitude, trip.pickup_location.longitude),
+                dropoff_location=(trip.dropoff_location.latitude, trip.dropoff_location.longitude),
                 current_cycle_hours=trip.current_cycle_hours
             )
             route_data['start_time'] = trip.start_time
         except Exception as e:
-            logger.error(f"Route calculation failed for trip {trip.id}: {str(e)}")
             return Response({'error': f'Route calculation failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
+        route, created = Route.objects.get_or_create(
+            trip=trip,
+            defaults={
+                'total_distance': route_data['total_distance'],
+                'estimated_driving_time': route_data['estimated_driving_time'],
+                'route_data': route_data['route_data']
+            }
+        )
+        
+        if not created:
+            route.total_distance = route_data['total_distance']
+            route.estimated_driving_time = route_data['estimated_driving_time']
+            route.route_data = route_data['route_data']
+            route.save()
+        
         try:
-            route, created = Route.objects.get_or_create(
-                trip=trip,
-                defaults={
-                    'total_distance': route_data['total_distance'],
-                    'estimated_driving_time': route_data['estimated_driving_time'],
-                    'route_data': route_data['route_data']
-                }
-            )
-            
-            if not created:
-                route.total_distance = route_data['total_distance']
-                route.estimated_driving_time = route_data['estimated_driving_time']
-                route.route_data = route_data['route_data']
-                route.save()
-            
-            # Delete existing waypoints
             route.waypoints.all().delete()
-            
-            # Calculate rest stops
-            rest_stops = calculate_rest_stops(
-                route_data=route_data,
-                current_cycle_hours=trip.current_cycle_hours,
-                trip_start_time=trip.start_time
-            )
+            rest_stops = calculate_rest_stops(route_data=route_data, current_cycle_hours=trip.current_cycle_hours)
             
             sequence = 0
-            # Ensure trip.start_time is timezone-aware
-            start_time = trip.start_time
-            if not django_timezone.is_aware(start_time):
-                start_time = django_timezone.make_aware(start_time, timezone=timezone.utc)
-            
-            # Calculate pickup arrival time
-            pickup_arrival = start_time + timedelta(hours=route_data['segments'][0]['duration'])
+            # Calculate pickup arrival time based on driving from current_location to pickup_location
+            pickup_arrival = trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600)
             Waypoint.objects.create(
                 route=route,
                 location=trip.pickup_location,
@@ -164,7 +146,6 @@ class TripViewSet(viewsets.ModelViewSet):
             )
             sequence += 1
             
-            # Create waypoints for rest stops
             for stop in rest_stops:
                 stop_location = Location.objects.create(
                     name=stop['name'],
@@ -172,34 +153,26 @@ class TripViewSet(viewsets.ModelViewSet):
                     longitude=stop['longitude'],
                     address=stop.get('address', '')
                 )
-                # Ensure estimated_arrival is timezone-aware
-                estimated_arrival = stop['estimated_arrival']
-                if not django_timezone.is_aware(estimated_arrival):
-                    estimated_arrival = django_timezone.make_aware(estimated_arrival, timezone=timezone.utc)
                 Waypoint.objects.create(
                     route=route,
                     location=stop_location,
                     waypoint_type=stop['type'],
                     sequence=sequence,
-                    estimated_arrival=estimated_arrival,
+                    estimated_arrival=stop['estimated_arrival'],
                     planned_duration=stop['duration']
                 )
                 sequence += 1
             
-            # Calculate dropoff time
             if rest_stops:
                 last_stop_duration = rest_stops[-1]['duration']
                 last_arrival = rest_stops[-1]['estimated_arrival']
-                if not django_timezone.is_aware(last_arrival):
-                    last_arrival = django_timezone.make_aware(last_arrival, timezone=timezone.utc)
             else:
                 last_stop_duration = 0
-                last_arrival = start_time + timedelta(hours=route_data['segments'][0]['duration'] + 1)  # Pickup duration
+                last_arrival = trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600 + 1)  # Pickup duration
             
-            final_segment_duration = route_data['segments'][-1]['duration']
+            final_segment_duration = route_data['segments'][-1]['duration'] / 3600
             final_eta = last_arrival + timedelta(hours=last_stop_duration + final_segment_duration)
             
-            # Create dropoff waypoint
             Waypoint.objects.create(
                 route=route,
                 location=trip.dropoff_location,
@@ -209,16 +182,12 @@ class TripViewSet(viewsets.ModelViewSet):
                 planned_duration=1.0
             )
             
-            # Update trip estimated end time
             trip.estimated_end_time = final_eta + timedelta(hours=1)
-            if not django_timezone.is_aware(trip.estimated_end_time):
-                trip.estimated_end_time = django_timezone.make_aware(trip.estimated_end_time, timezone=timezone.utc)
             trip.save()
             
             return Response(RouteSerializer(route).data)
         except Exception as e:
-            logger.error(f"Error creating waypoints for trip {trip.id}: {str(e)}")
-            return Response({'error': f'Error creating waypoints: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     @action(detail=True, methods=['post'])
     def generate_logs(self, request, pk=None):
