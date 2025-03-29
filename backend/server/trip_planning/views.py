@@ -9,7 +9,7 @@ import json
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from django.utils.timezone import make_aware
+from django.utils import timezone as django_timezone
 import logging
 
 from .models import Trip, Route, Location, Waypoint, LogEntry, DailyLog
@@ -132,10 +132,18 @@ class TripViewSet(viewsets.ModelViewSet):
 
         try:
             route.waypoints.all().delete()
-            rest_stops = calculate_rest_stops(route_data=route_data, current_cycle_hours=trip.current_cycle_hours)
+            rest_stops = calculate_rest_stops(route_data=route_data, current_cycle_hours=trip.current_cycle_hours, trip_start_time=trip.start_time)
             
             sequence = 0
-            pickup_arrival = make_aware(trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600))
+            # Ensure trip.start_time is timezone-aware
+            start_time = trip.start_time
+            if not django_timezone.is_aware(start_time):
+                start_time = django_timezone.make_aware(start_time, timezone=timezone.utc)
+            
+            # Calculate pickup arrival time
+            pickup_arrival = start_time + timedelta(hours=route_data['segments'][0]['duration'])
+            if not django_timezone.is_aware(pickup_arrival):
+                pickup_arrival = django_timezone.make_aware(pickup_arrival, timezone=timezone.utc)
             
             logger.info("Creating Pickup Waypoint")
             Waypoint.objects.create(
@@ -156,7 +164,10 @@ class TripViewSet(viewsets.ModelViewSet):
                     address=stop.get('address', '')
                 )
                 
-                estimated_arrival = make_aware(stop['estimated_arrival'])
+                # Only call make_aware if the datetime is naive
+                estimated_arrival = stop['estimated_arrival']
+                if not django_timezone.is_aware(estimated_arrival):
+                    estimated_arrival = django_timezone.make_aware(estimated_arrival, timezone=timezone.utc)
                 
                 logger.info(f"Creating Waypoint for {stop['name']} at ({stop['latitude']}, {stop['longitude']})")
                 Waypoint.objects.create(
@@ -171,13 +182,19 @@ class TripViewSet(viewsets.ModelViewSet):
             
             if rest_stops:
                 last_stop_duration = rest_stops[-1]['duration']
-                last_arrival = make_aware(rest_stops[-1]['estimated_arrival'])
+                last_arrival = rest_stops[-1]['estimated_arrival']
+                if not django_timezone.is_aware(last_arrival):
+                    last_arrival = django_timezone.make_aware(last_arrival, timezone=timezone.utc)
             else:
                 last_stop_duration = 0
-                last_arrival = make_aware(trip.start_time + timedelta(hours=route_data['segments'][0]['duration']/3600 + 1))
+                last_arrival = start_time + timedelta(hours=route_data['segments'][0]['duration'] + 1)
+                if not django_timezone.is_aware(last_arrival):
+                    last_arrival = django_timezone.make_aware(last_arrival, timezone=timezone.utc)
             
-            final_segment_duration = route_data['segments'][-1]['duration'] / 3600
+            final_segment_duration = route_data['segments'][-1]['duration']
             final_eta = last_arrival + timedelta(hours=last_stop_duration + final_segment_duration)
+            if not django_timezone.is_aware(final_eta):
+                final_eta = django_timezone.make_aware(final_eta, timezone=timezone.utc)
             
             logger.info("Creating Dropoff Waypoint")
             Waypoint.objects.create(
@@ -185,18 +202,20 @@ class TripViewSet(viewsets.ModelViewSet):
                 location=trip.dropoff_location,
                 waypoint_type='dropoff',
                 sequence=sequence,
-                estimated_arrival=make_aware(final_eta),
+                estimated_arrival=final_eta,
                 planned_duration=1.0
             )
             
-            trip.estimated_end_time = make_aware(final_eta + timedelta(hours=1))
+            trip.estimated_end_time = final_eta + timedelta(hours=1)
+            if not django_timezone.is_aware(trip.estimated_end_time):
+                trip.estimated_end_time = django_timezone.make_aware(trip.estimated_end_time, timezone=timezone.utc)
             trip.save()
             
             return Response(RouteSerializer(route).data)
         except Exception as e:
             logger.error(f"Error processing waypoints: {e}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
+        
     @action(detail=True, methods=['post'])
     def generate_logs(self, request, pk=None):
         logger.info(f"Starting generate_logs for trip ID {pk} by user {request.user.id}")

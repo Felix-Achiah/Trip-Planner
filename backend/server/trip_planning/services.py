@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta, time
 import math
 import logging
-from django.utils import timezone
+from django.utils import timezone as django_timezone
 
 # Load environment variables
 load_dotenv()
@@ -107,191 +107,102 @@ def interpolate_coordinates(start_coord, end_coord, fraction):
     interpolated_lat = start_lat + (end_lat - start_lat) * fraction
     return (interpolated_lon, interpolated_lat)
 
-def calculate_rest_stops(route_data, current_cycle_hours):
+def calculate_rest_stops(route_data, current_cycle_hours, trip_start_time):
     """
     Calculate rest stops based on route data and HOS regulations.
     
     Args:
         route_data (dict): Route data from calculate_route_service
         current_cycle_hours (float): Current cycle hours used
+        trip_start_time (datetime): The trip's start time
         
     Returns:
         list: List of rest stops (rest, fuel, overnight)
     """
     segments = route_data['segments']
     total_distance = route_data['total_distance']
+    total_driving_time = route_data['estimated_driving_time']  # Total driving time for the trip
     
-    # Start time (should ideally be the trip's start time, but using datetime.now() as per original code)
-    current_time = datetime.now()
-    remaining_drive_time = MAX_DRIVING_TIME
-    remaining_on_duty_time = MAX_ON_DUTY_TIME
+    # Ensure trip_start_time is timezone-aware
+    current_time = trip_start_time
+    if not django_timezone.is_aware(current_time):
+        current_time = django_timezone.make_aware(current_time, timezone=django_timezone.utc)
+
+    remaining_drive_time = MAX_DRIVING_TIME  # 11 hours
+    remaining_on_duty_time = MAX_ON_DUTY_TIME  # 14 hours
     remaining_cycle_time = MAX_CYCLE_TIME - current_cycle_hours
     time_since_break = 0
     distance_since_fuel = 0
+    total_time_processed = 0  # Track total driving time processed
     
     rest_stops = []
     current_position = None
     
-    logger.info(f"Calculating rest stops: drive_time={remaining_drive_time}, on_duty={remaining_on_duty_time}, cycle={remaining_cycle_time}")
+    logger.info(f"Calculating rest stops: total_driving_time={total_driving_time}, drive_time={remaining_drive_time}, on_duty={remaining_on_duty_time}, cycle={remaining_cycle_time}")
     
-    for i, segment in enumerate(segments):
-        if i == 0:
-            current_position = segment['start_coord']
-            # Account for pickup time
-            current_time += timedelta(hours=PICKUP_DROPOFF_TIME)
-            remaining_on_duty_time -= PICKUP_DROPOFF_TIME
-            remaining_cycle_time -= PICKUP_DROPOFF_TIME
-            current_position = segment['end_coord']
-            if remaining_on_duty_time <= 0 or remaining_cycle_time <= 0:
-                # Insert an overnight stop immediately after pickup if HOS limits are exceeded
-                rest_stops.append({
-                    'name': f"Overnight Rest {len(rest_stops) + 1}",
-                    'type': 'overnight',
-                    'latitude': current_position[1],
-                    'longitude': current_position[0],
-                    'estimated_arrival': current_time,
-                    'duration': MANDATORY_RESET_BREAK
-                })
-                current_time += timedelta(hours=MANDATORY_RESET_BREAK)
-                remaining_drive_time = MAX_DRIVING_TIME
-                remaining_on_duty_time = MAX_ON_DUTY_TIME
-                remaining_cycle_time = MAX_CYCLE_TIME  # Reset cycle time after a 10-hour break
-                time_since_break = 0
-                distance_since_fuel = 0
-                logger.info(f"Added overnight stop after pickup due to HOS limits")
-        
-        possible_distance = segment['distance']
-        segment_time = segment['duration']
-        start_coord = segment['start_coord']
-        end_coord = segment['end_coord']
-        distance_covered = 0  # Track distance covered within the segment
-        
-        logger.info(f"Segment {i}: distance={possible_distance}, time={segment_time}, time_since_break={time_since_break}")
-        
-        while segment_time > 0:
-            # Calculate the time and distance that can be driven before hitting any HOS limit
-            time_before_break = max(0, MAX_DRIVING_BEFORE_BREAK - time_since_break)
-            time_before_fuel = max(0, (MAX_DISTANCE_BEFORE_FUEL - distance_since_fuel) / AVERAGE_SPEED)
-            time_before_drive_limit = max(0, remaining_drive_time)
-            time_before_duty_limit = max(0, remaining_on_duty_time)
-            time_before_cycle_limit = max(0, remaining_cycle_time)
-            
-            # Find the earliest limit that will be hit
-            drive_time = min(
-                segment_time,
-                time_before_break,
-                time_before_fuel,
-                time_before_drive_limit,
-                time_before_duty_limit,
-                time_before_cycle_limit
-            )
-            
-            if drive_time <= 0:
-                # If no driving is possible due to HOS limits, insert an overnight stop
-                fraction = distance_covered / possible_distance if possible_distance > 0 else 0
-                current_position = interpolate_coordinates(start_coord, end_coord, fraction)
-                rest_stops.append({
-                    'name': f"Overnight Rest {len(rest_stops) + 1}",
-                    'type': 'overnight',
-                    'latitude': current_position[1],
-                    'longitude': current_position[0],
-                    'estimated_arrival': current_time,
-                    'duration': MANDATORY_RESET_BREAK
-                })
-                current_time += timedelta(hours=MANDATORY_RESET_BREAK)
-                remaining_drive_time = MAX_DRIVING_TIME
-                remaining_on_duty_time = MAX_ON_DUTY_TIME
-                remaining_cycle_time = MAX_CYCLE_TIME  # Reset cycle time after a 10-hour break
-                time_since_break = 0
-                distance_since_fuel = 0
-                logger.info(f"Added overnight stop: remaining_segment_time={segment_time}")
-                continue
-            
-            # Drive for the allowed time
-            drive_distance = (drive_time / segment_time) * possible_distance if segment_time > 0 else 0
-            distance_covered += drive_distance
-            fraction = distance_covered / possible_distance if possible_distance > 0 else 0
+    # Process pickup time
+    current_position = segments[0]['start_coord']
+    current_time += timedelta(hours=PICKUP_DROPOFF_TIME)
+    remaining_on_duty_time -= PICKUP_DROPOFF_TIME
+    remaining_cycle_time -= PICKUP_DROPOFF_TIME
+    current_position = segments[0]['end_coord']
+    if remaining_on_duty_time <= 0 or remaining_cycle_time <= 0:
+        rest_stops.append({
+            'name': f"Overnight Rest {len(rest_stops) + 1}",
+            'type': 'overnight',
+            'latitude': current_position[1],
+            'longitude': current_position[0],
+            'estimated_arrival': current_time,
+            'duration': MANDATORY_RESET_BREAK
+        })
+        current_time += timedelta(hours=MANDATORY_RESET_BREAK)
+        remaining_drive_time = MAX_DRIVING_TIME
+        remaining_on_duty_time = MAX_ON_DUTY_TIME
+        remaining_cycle_time = MAX_CYCLE_TIME
+        time_since_break = 0
+        distance_since_fuel = 0
+        logger.info(f"Added overnight stop after pickup due to HOS limits")
+
+    # Process the entire trip duration
+    remaining_trip_time = total_driving_time
+    segment_index = 0
+    distance_covered = 0
+    total_distance_covered = 0
+
+    while remaining_trip_time > 0:
+        # Determine the current segment (if any) for coordinate interpolation
+        if segment_index < len(segments):
+            current_segment = segments[segment_index]
+            segment_distance = current_segment['distance']
+            segment_time = current_segment['duration']
+            start_coord = current_segment['start_coord']
+            end_coord = current_segment['end_coord']
+        else:
+            # If we've processed all segments, continue with the last position
+            segment_distance = total_distance - total_distance_covered
+            segment_time = remaining_trip_time
+            start_coord = current_position
+            end_coord = current_position  # No further movement in coordinates
+
+        # Calculate how much time we can drive before hitting a limit
+        time_before_break = max(0, MAX_DRIVING_BEFORE_BREAK - time_since_break)
+        time_before_fuel = max(0, (MAX_DISTANCE_BEFORE_FUEL - distance_since_fuel) / AVERAGE_SPEED)
+        time_before_drive_limit = max(0, remaining_drive_time)
+        time_before_duty_limit = max(0, remaining_on_duty_time)
+        time_before_cycle_limit = max(0, remaining_cycle_time)
+
+        drive_time = min(
+            remaining_trip_time,
+            time_before_break,
+            time_before_fuel,
+            time_before_drive_limit,
+            time_before_duty_limit,
+            time_before_cycle_limit
+        )
+
+        if drive_time <= 0:
+            fraction = distance_covered / segment_distance if segment_distance > 0 else 0
             current_position = interpolate_coordinates(start_coord, end_coord, fraction)
-            
-            # Check which limit was hit and insert the appropriate stop
-            if time_since_break + drive_time >= MAX_DRIVING_BEFORE_BREAK:
-                rest_stops.append({
-                    'name': f"Rest Break {len(rest_stops) + 1}",
-                    'type': 'rest',
-                    'latitude': current_position[1],
-                    'longitude': current_position[0],
-                    'estimated_arrival': current_time + timedelta(hours=drive_time),
-                    'duration': MANDATORY_BREAK_TIME
-                })
-                current_time += timedelta(hours=drive_time + MANDATORY_BREAK_TIME)
-                time_since_break = 0
-                remaining_drive_time -= drive_time
-                remaining_on_duty_time -= (drive_time + MANDATORY_BREAK_TIME)
-                remaining_cycle_time -= drive_time
-                distance_since_fuel += drive_distance
-                segment_time -= drive_time
-                possible_distance -= drive_distance
-                logger.info(f"Added rest stop: remaining_segment_time={segment_time}")
-            
-            elif distance_since_fuel + drive_distance >= MAX_DISTANCE_BEFORE_FUEL:
-                rest_stops.append({
-                    'name': f"Fuel Stop {len(rest_stops) + 1}",
-                    'type': 'fuel',
-                    'latitude': current_position[1],
-                    'longitude': current_position[0],
-                    'estimated_arrival': current_time + timedelta(hours=drive_time),
-                    'duration': FUEL_STOP_DURATION
-                })
-                current_time += timedelta(hours=drive_time + FUEL_STOP_DURATION)
-                time_since_break += drive_time
-                remaining_drive_time -= drive_time
-                remaining_on_duty_time -= (drive_time + FUEL_STOP_DURATION)
-                remaining_cycle_time -= drive_time
-                distance_since_fuel = 0
-                segment_time -= drive_time
-                possible_distance -= drive_distance
-                logger.info(f"Added fuel stop: remaining_segment_time={segment_time}")
-            
-            elif (remaining_drive_time <= drive_time or 
-                  remaining_on_duty_time <= drive_time or 
-                  remaining_cycle_time <= drive_time):
-                rest_stops.append({
-                    'name': f"Overnight Rest {len(rest_stops) + 1}",
-                    'type': 'overnight',
-                    'latitude': current_position[1],
-                    'longitude': current_position[0],
-                    'estimated_arrival': current_time + timedelta(hours=drive_time),
-                    'duration': MANDATORY_RESET_BREAK
-                })
-                current_time += timedelta(hours=drive_time + MANDATORY_RESET_BREAK)
-                remaining_drive_time = MAX_DRIVING_TIME
-                remaining_on_duty_time = MAX_ON_DUTY_TIME
-                remaining_cycle_time = MAX_CYCLE_TIME  # Reset cycle time after a 10-hour break
-                time_since_break = 0
-                distance_since_fuel = 0
-                segment_time -= drive_time
-                possible_distance -= drive_distance
-                logger.info(f"Added overnight stop: remaining_segment_time={segment_time}")
-            
-            else:
-                # No limits hit, complete the segment
-                current_time += timedelta(hours=drive_time)
-                time_since_break += drive_time
-                remaining_drive_time -= drive_time
-                remaining_on_duty_time -= drive_time
-                remaining_cycle_time -= drive_time
-                distance_since_fuel += drive_distance
-                segment_time -= drive_time
-                possible_distance -= drive_distance
-                current_position = end_coord
-                logger.info(f"Completed segment: time_since_break={time_since_break}")
-    
-    if segments:
-        # Account for dropoff time
-        remaining_on_duty_time -= PICKUP_DROPOFF_TIME
-        remaining_cycle_time -= PICKUP_DROPOFF_TIME
-        if remaining_on_duty_time <= 0 or remaining_cycle_time <= 0:
-            # Insert an overnight stop after dropoff if HOS limits are exceeded
             rest_stops.append({
                 'name': f"Overnight Rest {len(rest_stops) + 1}",
                 'type': 'overnight',
@@ -306,10 +217,118 @@ def calculate_rest_stops(route_data, current_cycle_hours):
             remaining_cycle_time = MAX_CYCLE_TIME
             time_since_break = 0
             distance_since_fuel = 0
-            logger.info(f"Added overnight stop after dropoff due to HOS limits")
-    
+            logger.info(f"Added overnight stop: remaining_trip_time={remaining_trip_time}")
+            continue
+
+        # Calculate distance driven in this period
+        drive_distance = (drive_time / total_driving_time) * total_distance if total_driving_time > 0 else 0
+        distance_covered += drive_distance
+        total_distance_covered += drive_distance
+        fraction = distance_covered / segment_distance if segment_distance > 0 else 0
+        current_position = interpolate_coordinates(start_coord, end_coord, fraction)
+
+        # Check if we need a rest break (after 8 hours of driving)
+        if time_since_break + drive_time >= MAX_DRIVING_BEFORE_BREAK:
+            rest_stops.append({
+                'name': f"Rest Break {len(rest_stops) + 1}",
+                'type': 'rest',
+                'latitude': current_position[1],
+                'longitude': current_position[0],
+                'estimated_arrival': current_time + timedelta(hours=drive_time),
+                'duration': MANDATORY_BREAK_TIME
+            })
+            current_time += timedelta(hours=drive_time + MANDATORY_BREAK_TIME)
+            time_since_break = 0
+            remaining_drive_time -= drive_time
+            remaining_on_duty_time -= (drive_time + MANDATORY_BREAK_TIME)
+            remaining_cycle_time -= drive_time
+            distance_since_fuel += drive_distance
+            remaining_trip_time -= drive_time
+            total_time_processed += drive_time
+            logger.info(f"Added rest stop: remaining_trip_time={remaining_trip_time}")
+
+        # Check if we need a fuel stop (every 1000 miles)
+        elif distance_since_fuel + drive_distance >= MAX_DISTANCE_BEFORE_FUEL:
+            rest_stops.append({
+                'name': f"Fuel Stop {len(rest_stops) + 1}",
+                'type': 'fuel',
+                'latitude': current_position[1],
+                'longitude': current_position[0],
+                'estimated_arrival': current_time + timedelta(hours=drive_time),
+                'duration': FUEL_STOP_DURATION
+            })
+            current_time += timedelta(hours=drive_time + FUEL_STOP_DURATION)
+            time_since_break += drive_time
+            remaining_drive_time -= drive_time
+            remaining_on_duty_time -= (drive_time + FUEL_STOP_DURATION)
+            remaining_cycle_time -= drive_time
+            distance_since_fuel = 0
+            remaining_trip_time -= drive_time
+            total_time_processed += drive_time
+            logger.info(f"Added fuel stop: remaining_trip_time={remaining_trip_time}")
+
+        # Check if we hit HOS limits (11-hour driving, 14-hour on-duty, or 70-hour cycle)
+        elif (remaining_drive_time <= drive_time or 
+              remaining_on_duty_time <= drive_time or 
+              remaining_cycle_time <= drive_time):
+            rest_stops.append({
+                'name': f"Overnight Rest {len(rest_stops) + 1}",
+                'type': 'overnight',
+                'latitude': current_position[1],
+                'longitude': current_position[0],
+                'estimated_arrival': current_time + timedelta(hours=drive_time),
+                'duration': MANDATORY_RESET_BREAK
+            })
+            current_time += timedelta(hours=drive_time + MANDATORY_RESET_BREAK)
+            remaining_drive_time = MAX_DRIVING_TIME
+            remaining_on_duty_time = MAX_ON_DUTY_TIME
+            remaining_cycle_time = MAX_CYCLE_TIME
+            time_since_break = 0
+            distance_since_fuel = 0
+            remaining_trip_time -= drive_time
+            total_time_processed += drive_time
+            logger.info(f"Added overnight stop: remaining_trip_time={remaining_trip_time}")
+
+        else:
+            current_time += timedelta(hours=drive_time)
+            time_since_break += drive_time
+            remaining_drive_time -= drive_time
+            remaining_on_duty_time -= drive_time
+            remaining_cycle_time -= drive_time
+            distance_since_fuel += drive_distance
+            remaining_trip_time -= drive_time
+            total_time_processed += drive_time
+            current_position = end_coord
+            logger.info(f"Processed driving time: time_since_break={time_since_break}, remaining_trip_time={remaining_trip_time}")
+
+        # Move to the next segment if we've covered the current segment's distance
+        if segment_index < len(segments) and distance_covered >= segment_distance:
+            segment_index += 1
+            distance_covered = 0
+
+    # Account for dropoff time at the end of the trip
+    remaining_on_duty_time -= PICKUP_DROPOFF_TIME
+    remaining_cycle_time -= PICKUP_DROPOFF_TIME
+    if remaining_on_duty_time <= 0 or remaining_cycle_time <= 0:
+        rest_stops.append({
+            'name': f"Overnight Rest {len(rest_stops) + 1}",
+            'type': 'overnight',
+            'latitude': current_position[1],
+            'longitude': current_position[0],
+            'estimated_arrival': current_time,
+            'duration': MANDATORY_RESET_BREAK
+        })
+        current_time += timedelta(hours=MANDATORY_RESET_BREAK)
+        remaining_drive_time = MAX_DRIVING_TIME
+        remaining_on_duty_time = MAX_ON_DUTY_TIME
+        remaining_cycle_time = MAX_CYCLE_TIME
+        time_since_break = 0
+        distance_since_fuel = 0
+        logger.info(f"Added overnight stop after dropoff due to HOS limits")
+
     logger.info(f"Rest stops calculated: {rest_stops}")
     return rest_stops
+
 def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user):
     """
     Generate ELD logs for the trip based on pre-calculated waypoints.
@@ -342,9 +361,11 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     # Initialize variables
     log_entries = []
     daily_logs = {}
+    current_odometer = 0
     
     # Ensure trip.start_time is timezone-aware
-    trip_start_time = timezone.make_aware(trip.start_time) if not timezone.is_aware(trip.start_time) else trip.start_time
+    trip_start_time = django_timezone.make_aware(trip.start_time) if not django_timezone.is_aware(trip.start_time) else trip.start_time
+    current_time = trip_start_time
     current_date = trip_start_time.date()
     
     # Initialize daily log for the first day
@@ -358,7 +379,7 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     if not pickup_waypoint:
         logger.error(f"No pickup waypoint found for trip {trip.id}")
         raise ValueError("No pickup waypoint found for the trip")
-    pickup_time = timezone.make_aware(pickup_waypoint.estimated_arrival) if not timezone.is_aware(pickup_waypoint.estimated_arrival) else pickup_waypoint.estimated_arrival
+    pickup_time = django_timezone.make_aware(pickup_waypoint.estimated_arrival) if not django_timezone.is_aware(pickup_waypoint.estimated_arrival) else pickup_waypoint.estimated_arrival
     events.append({
         'type': 'pickup',
         'time': pickup_time,
@@ -367,8 +388,8 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     })
     
     # Add all rest stops, fuel stops, overnight stops, and mandatory breaks
-    for waypoint in waypoints.filter(waypoint_type__in=['rest', 'fuel', 'overnight', 'mandatory_break']).order_by('estimated_arrival'):
-        waypoint_time = timezone.make_aware(waypoint.estimated_arrival) if not timezone.is_aware(waypoint.estimated_arrival) else waypoint.estimated_arrival
+    for waypoint in waypoints.filter(waypoint_type__in=['rest', 'fuel', 'overnight']).order_by('estimated_arrival'):
+        waypoint_time = django_timezone.make_aware(waypoint.estimated_arrival) if not django_timezone.is_aware(waypoint.estimated_arrival) else waypoint.estimated_arrival
         events.append({
             'type': waypoint.waypoint_type,
             'time': waypoint_time,
@@ -381,7 +402,7 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     if not dropoff_waypoint:
         logger.error(f"No dropoff waypoint found for trip {trip.id}")
         raise ValueError("No dropoff waypoint found for the trip")
-    dropoff_time = timezone.make_aware(dropoff_waypoint.estimated_arrival) if not timezone.is_aware(dropoff_waypoint.estimated_arrival) else dropoff_waypoint.estimated_arrival
+    dropoff_time = django_timezone.make_aware(dropoff_waypoint.estimated_arrival) if not django_timezone.is_aware(dropoff_waypoint.estimated_arrival) else dropoff_waypoint.estimated_arrival
     events.append({
         'type': 'dropoff',
         'time': dropoff_time,
@@ -393,178 +414,169 @@ def generate_eld_logs_service(trip, route, waypoints, current_cycle_hours, user)
     events.sort(key=lambda x: x['time'])
     logger.info(f"Events to process: {events}")
 
-    # Initialize status tracking
-    current_status = 'off_duty'
-    status_start_time = trip_start_time
+    # Initialize HOS tracking
+    remaining_drive_time = MAX_DRIVING_TIME
+    remaining_on_duty_time = MAX_ON_DUTY_TIME
+    time_since_break = 0
     
     # Process each event chronologically
     for i, event in enumerate(events):
         logger.info(f"Processing event {i}: {event}")
         
-        # If this is the first event, add driving time from trip start to first event
-        if i == 0 and event['type'] == 'pickup':
-            driving_duration = (event['time'] - trip.start_time).total_seconds() / 3600
-            logger.info(f"Initial driving duration: {driving_duration} hours")
+        # Calculate driving time to this event (if not the first event)
+        if i > 0:
+            prev_event = events[i - 1]
+            prev_end_time = prev_event['time'] + timedelta(hours=prev_event['duration'])
+            driving_duration = (event['time'] - prev_end_time).total_seconds() / 3600.0  # in hours
+            
             if driving_duration > 0:
-                current_time = trip.start_time
-                while current_time < event['time']:
-                    current_date = current_time.date()
-                    if current_date not in daily_logs:
-                        daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
-                    next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
-                    end_segment = min(next_day, event['time'])
-                    segment_duration = (end_segment - current_time).total_seconds() / 3600
+                # Apply HOS limits to driving period
+                time_before_break = max(0, MAX_DRIVING_BEFORE_BREAK - time_since_break)
+                time_before_drive_limit = max(0, remaining_drive_time)
+                time_before_duty_limit = max(0, remaining_on_duty_time)
+                
+                remaining_driving = driving_duration
+                current_segment_start = prev_end_time
+                
+                while remaining_driving > 0:
+                    drive_time = min(
+                        remaining_driving,
+                        time_before_break,
+                        time_before_drive_limit,
+                        time_before_duty_limit
+                    )
                     
+                    if drive_time <= 0:
+                        # Should have been handled by calculate_rest_stops, log an error
+                        logger.error(f"HOS limit reached without a rest stop: drive_time={remaining_drive_time}, on_duty={remaining_on_duty_time}")
+                        break
+                    
+                    drive_end_time = current_segment_start + timedelta(hours=drive_time)
                     log_entries.append({
-                        'start_time': current_time,
-                        'end_time': end_segment,
+                        'start_time': current_segment_start,
+                        'end_time': drive_end_time,
                         'status': 'driving',
-                        'location_id': trip.current_location.id if hasattr(trip.current_location, 'id') else None,
-                        'notes': "Driving to pickup location"
+                        'location_id': prev_event['location'].id if hasattr(prev_event['location'], 'id') else None,
+                        'notes': f"Driving to {event['type']}"
                     })
-                    daily_logs[current_date]['total_driving_hours'] += segment_duration
-                    daily_logs[current_date]['total_on_duty_hours'] += segment_duration  # Driving counts as on-duty
-                    update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
-                    logger.info(f"Added initial driving on {current_date}: {segment_duration} hours")
-                    current_time = end_segment
-            current_status = 'driving'
-            status_start_time = event['time']
-        
-        # Process driving time before the event (if any)
-        if current_status and status_start_time and event['time'] > status_start_time:
-            duration = (event['time'] - status_start_time).total_seconds() / 3600
-            if duration > 0:
-                current_time = status_start_time
-                while current_time < event['time']:
-                    current_date = current_time.date()
-                    if current_date not in daily_logs:
-                        daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
-                    next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
-                    end_segment = min(next_day, event['time'])
-                    segment_duration = (end_segment - current_time).total_seconds() / 3600
                     
-                    log_entries.append({
-                        'start_time': current_time,
-                        'end_time': end_segment,
-                        'status': current_status,
-                        'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
-                        'notes': f"En route to {event['type']}"
-                    })
-                    if current_status == 'driving':
+                    # Update daily logs for this driving period
+                    current_time_temp = current_segment_start
+                    while current_time_temp < drive_end_time:
+                        current_date = current_time_temp.date()
+                        if current_date not in daily_logs:
+                            daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
+                        next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time_temp.tzinfo)
+                        segment_end = min(next_day, drive_end_time)
+                        segment_duration = (segment_end - current_time_temp).total_seconds() / 3600.0
                         daily_logs[current_date]['total_driving_hours'] += segment_duration
                         daily_logs[current_date]['total_on_duty_hours'] += segment_duration
-                        update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'driving')
-                        logger.info(f"Added driving before {event['type']} on {current_date}: {segment_duration} hours")
-                    current_time = end_segment
+                        update_log_grid(daily_logs[current_date]['log_data'], current_time_temp, segment_end, 'driving')
+                        current_odometer += segment_duration * AVERAGE_SPEED
+                        current_time_temp = segment_end
+                    
+                    time_since_break += drive_time
+                    remaining_drive_time -= drive_time
+                    remaining_on_duty_time -= drive_time
+                    remaining_driving -= drive_time
+                    current_segment_start = drive_end_time
         
-        # Process the event based on its type
+        # Process the event itself
+        event_end_time = event['time'] + timedelta(hours=event['duration'])
         if event['type'] == 'pickup':
-            current_status = 'on_duty_not_driving'
-            status_start_time = event['time']
-            event_end_time = event['time'] + timedelta(hours=event['duration'])
+            log_entries.append({
+                'start_time': event['time'],
+                'end_time': event_end_time,
+                'status': 'on_duty_not_driving',
+                'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                'activity': 'Loading',
+                'notes': "Loading at pickup location"
+            })
             current_time = event['time']
             while current_time < event_end_time:
                 current_date = current_time.date()
                 if current_date not in daily_logs:
                     daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
                 next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
-                end_segment = min(next_day, event_end_time)
-                segment_duration = (end_segment - current_time).total_seconds() / 3600
-                log_entries.append({
-                    'start_time': current_time,
-                    'end_time': end_segment,
-                    'status': 'on_duty_not_driving',
-                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
-                    'activity': 'Loading',
-                    'notes': "Loading at pickup location"
-                })
+                segment_end = min(next_day, event_end_time)
+                segment_duration = (segment_end - current_time).total_seconds() / 3600.0
                 daily_logs[current_date]['total_on_duty_hours'] += segment_duration
-                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'on_duty_not_driving')
-                current_time = end_segment
-            current_status = 'driving'
-            status_start_time = event_end_time
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, segment_end, 'on_duty_not_driving')
+                current_time = segment_end
+            remaining_on_duty_time -= event['duration']
         
-        elif event['type'] in ['rest', 'fuel', 'mandatory_break']:
-            current_status = 'off_duty'
-            status_start_time = event['time']
-            event_end_time = event['time'] + timedelta(hours=event['duration'])
+        elif event['type'] in ['rest', 'fuel']:
+            log_entries.append({
+                'start_time': event['time'],
+                'end_time': event_end_time,
+                'status': 'off_duty',
+                'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                'notes': f"{event['type'].capitalize()} stop"
+            })
             current_time = event['time']
             while current_time < event_end_time:
                 current_date = current_time.date()
                 if current_date not in daily_logs:
                     daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
                 next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
-                end_segment = min(next_day, event_end_time)
-                segment_duration = (end_segment - current_time).total_seconds() / 3600
-                log_entries.append({
-                    'start_time': current_time,
-                    'end_time': end_segment,
-                    'status': 'off_duty',
-                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
-                    'notes': f"{event['type'].capitalize()} stop"
-                })
+                segment_end = min(next_day, event_end_time)
+                segment_duration = (segment_end - current_time).total_seconds() / 3600.0
                 daily_logs[current_date]['total_off_duty_hours'] += segment_duration
-                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'off_duty')
-                current_time = end_segment
-            current_status = 'driving'
-            status_start_time = event_end_time
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, segment_end, 'off_duty')
+                current_time = segment_end
+            time_since_break = 0
+            remaining_on_duty_time -= event['duration']
         
         elif event['type'] == 'overnight':
-            current_status = 'sleeper_berth'
-            status_start_time = event['time']
-            event_end_time = event['time'] + timedelta(hours=event['duration'])
+            log_entries.append({
+                'start_time': event['time'],
+                'end_time': event_end_time,
+                'status': 'sleeper_berth',
+                'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                'notes': "Overnight stop"
+            })
             current_time = event['time']
             while current_time < event_end_time:
                 current_date = current_time.date()
                 if current_date not in daily_logs:
                     daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
                 next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
-                end_segment = min(next_day, event_end_time)
-                segment_duration = (end_segment - current_time).total_seconds() / 3600
-                log_entries.append({
-                    'start_time': current_time,
-                    'end_time': end_segment,
-                    'status': 'sleeper_berth',
-                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
-                    'notes': "Overnight stop"
-                })
+                segment_end = min(next_day, event_end_time)
+                segment_duration = (segment_end - current_time).total_seconds() / 3600.0
                 daily_logs[current_date]['total_sleeper_berth_hours'] += segment_duration
-                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'sleeper_berth')
-                current_time = end_segment
-            current_status = 'driving'
-            status_start_time = event_end_time
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, segment_end, 'sleeper_berth')
+                current_time = segment_end
+            remaining_drive_time = MAX_DRIVING_TIME
+            remaining_on_duty_time = MAX_ON_DUTY_TIME
+            time_since_break = 0
         
         elif event['type'] == 'dropoff':
-            current_status = 'on_duty_not_driving'
-            status_start_time = event['time']
-            event_end_time = event['time'] + timedelta(hours=event['duration'])
+            log_entries.append({
+                'start_time': event['time'],
+                'end_time': event_end_time,
+                'status': 'on_duty_not_driving',
+                'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
+                'activity': 'Unloading',
+                'notes': "Unloading at delivery location"
+            })
             current_time = event['time']
             while current_time < event_end_time:
                 current_date = current_time.date()
                 if current_date not in daily_logs:
                     daily_logs[current_date] = initialize_daily_log(current_date, current_date - timedelta(days=1), daily_logs)
                 next_day = datetime.combine(current_date + timedelta(days=1), time.min, tzinfo=current_time.tzinfo)
-                end_segment = min(next_day, event_end_time)
-                segment_duration = (end_segment - current_time).total_seconds() / 3600
-                log_entries.append({
-                    'start_time': current_time,
-                    'end_time': end_segment,
-                    'status': 'on_duty_not_driving',
-                    'location_id': event['location'].id if hasattr(event['location'], 'id') else None,
-                    'activity': 'Unloading',
-                    'notes': "Unloading at delivery location"
-                })
+                segment_end = min(next_day, event_end_time)
+                segment_duration = (segment_end - current_time).total_seconds() / 3600.0
                 daily_logs[current_date]['total_on_duty_hours'] += segment_duration
-                update_log_grid(daily_logs[current_date]['log_data'], current_time, end_segment, 'on_duty_not_driving')
-                current_time = end_segment
-            current_status = 'off_duty'
-            status_start_time = event_end_time
+                update_log_grid(daily_logs[current_date]['log_data'], current_time, segment_end, 'on_duty_not_driving')
+                current_time = segment_end
+            remaining_on_duty_time -= event['duration']
     
     # Finalize daily logs
     daily_logs_list = []
     for date in sorted(daily_logs.keys()):
         daily_log = daily_logs[date]
-        daily_log['ending_odometer'] = calculate_odometer(daily_log['starting_odometer'], daily_log['total_driving_hours'])
+        daily_log['ending_odometer'] = current_odometer
         daily_logs_list.append(daily_log)
     
     total_on_duty_hours = sum(log['total_on_duty_hours'] for log in daily_logs_list)
